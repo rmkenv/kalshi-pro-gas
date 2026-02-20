@@ -1,7 +1,8 @@
 import streamlit as st
 import requests
 import pandas as pd
-from kalshi_pro_gas import ProGasAlgo
+import traceback
+from progas import ProGasAlgo
 
 
 # =========================
@@ -9,18 +10,11 @@ from kalshi_pro_gas import ProGasAlgo
 # =========================
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
-
-# Known Kalshi gas/fuel series tickers
-GAS_SERIES = [
-    "KXAAAGASM",    # AAA national average gas price (weekly)
-    "KXGASPRICES",  # fallback alias
-]
+GAS_SERIES = ["KXAAAGASM"]
 
 
 def search_kalshi_gas_markets() -> list[dict]:
-    """
-    Fetch all open markets across known gas-related Kalshi series tickers.
-    """
+    """Fetch all open markets from known gas series tickers."""
     results = []
     seen_tickers = set()
 
@@ -42,69 +36,54 @@ def search_kalshi_gas_markets() -> list[dict]:
                         continue
                     seen_tickers.add(ticker)
 
-                    yes_c = m.get("yes_price")
-                    no_c = m.get("no_price")
-                    yes_price = yes_c / 100.0 if isinstance(yes_c, (int, float)) else None
-                    no_price = no_c / 100.0 if isinstance(no_c, (int, float)) else None
-                    spread_est = (
-                        abs(yes_price - (1.0 - no_price))
-                        if yes_price is not None and no_price is not None
-                        else None
-                    )
+                    # yes_price/no_price are always None — use bid/ask instead
+                    yes_bid = m.get("yes_bid")   # cents
+                    yes_ask = m.get("yes_ask")   # cents
+                    no_bid  = m.get("no_bid")
+                    no_ask  = m.get("no_ask")
+
+                    yes_bid_f  = yes_bid  / 100.0 if isinstance(yes_bid,  (int, float)) else None
+                    yes_ask_f  = yes_ask  / 100.0 if isinstance(yes_ask,  (int, float)) else None
+                    no_bid_f   = no_bid   / 100.0 if isinstance(no_bid,   (int, float)) else None
+                    mid_price  = (yes_bid_f + yes_ask_f) / 2.0 if yes_bid_f and yes_ask_f else None
+                    spread_est = (yes_ask_f - yes_bid_f)        if yes_bid_f and yes_ask_f else None
+
                     results.append({
-                        "ticker": ticker,
+                        "ticker":        ticker,
                         "series_ticker": m.get("series_ticker"),
-                        "title": m.get("title", "").replace("**", ""),
-                        "strike": m.get("floor_strike"),
-                        "yes_price": yes_price,
-                        "no_price": no_price,
-                        "spread_est": spread_est,
-                        "volume": m.get("volume"),
+                        "title":         m.get("title", "").replace("**", ""),
+                        "strike":        m.get("floor_strike"),
+                        "yes_bid":       yes_bid_f,
+                        "yes_ask":       yes_ask_f,
+                        "no_bid":        no_bid_f,
+                        "mid_price":     mid_price,
+                        "spread_est":    spread_est,
+                        "last_price":    m.get("last_price", 0) / 100.0 if m.get("last_price") else None,
+                        "volume":        m.get("volume"),
                         "open_interest": m.get("open_interest"),
-                        "close_time": m.get("close_time"),
-                        "rules": m.get("rules_primary", ""),
+                        "close_time":    m.get("close_time"),
                     })
 
                 cursor = data.get("cursor")
                 if not cursor or not markets:
                     break
-            except Exception:
+            except Exception as e:
+                st.warning(f"Error fetching series {series}: {e}")
                 break
 
-    # Sort by strike price ascending (natural price ladder)
     results.sort(key=lambda x: x.get("strike") or 0)
     return results
 
 
 def get_kalshi_orderbook(market_ticker: str) -> dict | None:
-    """Fetch live orderbook for a specific market ticker."""
+    """Fetch live orderbook depth (top 5 levels) for display only."""
     try:
         r = requests.get(f"{BASE}/markets/{market_ticker}/orderbook", timeout=10)
         r.raise_for_status()
         ob = r.json().get("orderbook", {})
-        yes_bids = ob.get("yes", [])
-        no_bids = ob.get("no", [])
-        best_yes = yes_bids[0][0] / 100.0 if yes_bids else None
-        best_no = no_bids[0][0] / 100.0 if no_bids else None
-        implied_yes_ask = (1.0 - best_no) if best_no is not None else None
-        mid = (
-            (best_yes + implied_yes_ask) / 2.0
-            if best_yes is not None and implied_yes_ask is not None
-            else best_yes
-        )
-        spread = (
-            implied_yes_ask - best_yes
-            if best_yes is not None and implied_yes_ask is not None
-            else None
-        )
         return {
-            "best_yes_bid": best_yes,
-            "best_no_bid": best_no,
-            "implied_yes_ask": implied_yes_ask,
-            "mid_price": mid,
-            "spread": spread,
-            "yes_depth": yes_bids[:5],
-            "no_depth": no_bids[:5],
+            "yes_depth": ob.get("yes", [])[:5],
+            "no_depth":  ob.get("no",  [])[:5],
         }
     except Exception:
         return None
@@ -126,21 +105,19 @@ with st.sidebar:
     api_key = None
     if "FRED_API_KEY" in st.secrets:
         api_key = st.secrets["FRED_API_KEY"]
-        st.success("FRED API key loaded.")
+        st.success("✅ FRED API key loaded.")
     else:
-        st.error("Missing `FRED_API_KEY` in `.streamlit/secrets.toml`.")
+        st.error("❌ Missing `FRED_API_KEY` in `.streamlit/secrets.toml`.")
 
     force_refresh = st.button("🔄 Force Refresh FRED Data")
 
     st.divider()
-
     st.header("📖 How This Works")
     st.markdown("""
 **Step 1 — Browse Gas Markets**
 
-Click **🔍 Find Open Gas Markets** to pull all open Kalshi markets
-from known gas series tickers. Select one from the table to auto-populate
-the inputs below.
+Click **🔍 Find Open Gas Markets** to pull all open Kalshi markets.
+Select one from the table to auto-populate the inputs below.
 
 ---
 
@@ -164,8 +141,8 @@ and runs a multi-factor model:
 
 > **Edge = Fair Value − Market Price**
 
-- **Positive edge** → model thinks market is *underpriced* → potential BUY
-- **Negative edge** → model thinks market is *overpriced* → PASS or fade
+- **Positive edge** → model thinks YES is *underpriced* → potential BUY
+- **Negative edge** → model thinks YES is *overpriced* → PASS or fade
 
 ---
 
@@ -201,29 +178,34 @@ st.markdown("Multi-factor gas price prediction for Kalshi prediction markets —
 st.subheader("🔍 Browse Open Gas Markets")
 
 if st.button("🔍 Find Open Gas Markets", type="primary"):
-    with st.spinner("Fetching open markets from Kalshi gas series..."):
+    with st.spinner("Fetching open markets from Kalshi..."):
         gas_markets = search_kalshi_gas_markets()
     st.session_state["gas_markets"] = gas_markets
+    # Clear previous selection when refreshing
+    st.session_state.pop("selected_market", None)
+    st.session_state.pop("selected_orderbook", None)
 
 if "gas_markets" in st.session_state:
     gas_markets = st.session_state["gas_markets"]
     if not gas_markets:
-        st.warning("No open gas markets found. Kalshi may not have active gas markets right now.")
+        st.warning("No open gas markets found on Kalshi right now.")
     else:
         st.success(f"Found **{len(gas_markets)}** open gas markets.")
 
         df = pd.DataFrame([
             {
-                "Select": False,
-                "Ticker": m["ticker"],
-                "Title": m["title"],
-                "Strike": f"${m['strike']:.2f}" if m.get("strike") is not None else "N/A",
-                "YES Price": f"{m['yes_price']:.2%}" if m.get("yes_price") is not None else "N/A",
-                "NO Price": f"{m['no_price']:.2%}" if m.get("no_price") is not None else "N/A",
-                "Est. Spread": f"{m['spread_est']:.2%}" if m.get("spread_est") is not None else "N/A",
-                "Volume": m.get("volume") or 0,
+                "Select":        False,
+                "Ticker":        m["ticker"],
+                "Title":         m["title"],
+                "Strike":        f"${m['strike']:.2f}" if m.get("strike") is not None else "N/A",
+                "YES Bid":       f"{m['yes_bid']:.0%}"   if m.get("yes_bid")   is not None else "N/A",
+                "YES Ask":       f"{m['yes_ask']:.0%}"   if m.get("yes_ask")   is not None else "N/A",
+                "Mid":           f"{m['mid_price']:.0%}" if m.get("mid_price") is not None else "N/A",
+                "Spread":        f"{m['spread_est']:.0%}" if m.get("spread_est") is not None else "N/A",
+                "Last":          f"{m['last_price']:.0%}" if m.get("last_price") is not None else "N/A",
+                "Volume":        m.get("volume") or 0,
                 "Open Interest": m.get("open_interest") or 0,
-                "Closes": m["close_time"][:10] if m.get("close_time") else "N/A",
+                "Closes":        m["close_time"][:10] if m.get("close_time") else "N/A",
             }
             for m in gas_markets
         ])
@@ -247,27 +229,21 @@ if "gas_markets" in st.session_state:
 
             if selected_market:
                 st.session_state["selected_market"] = selected_market
-                with st.spinner(f"Fetching orderbook for {selected_ticker}..."):
+                with st.spinner(f"Fetching orderbook depth for {selected_ticker}..."):
                     ob = get_kalshi_orderbook(selected_ticker)
                 st.session_state["selected_orderbook"] = ob
                 st.success(f"✅ Selected: `{selected_ticker}` — {selected_market.get('title')}")
 
-                mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-                mc1.metric("YES Price", f"{selected_market['yes_price']:.2%}" if selected_market.get("yes_price") is not None else "N/A")
-                mc2.metric("NO Price", f"{selected_market['no_price']:.2%}" if selected_market.get("no_price") is not None else "N/A")
-                mc3.metric("Volume", f"{selected_market.get('volume', 0):,}")
-                mc4.metric("Open Interest", f"{selected_market.get('open_interest', 0):,}")
-                mc5.metric("Closes", selected_market["close_time"][:10] if selected_market.get("close_time") else "N/A")
+                mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+                mc1.metric("YES Bid",  f"{selected_market['yes_bid']:.0%}"   if selected_market.get("yes_bid")   is not None else "N/A")
+                mc2.metric("YES Ask",  f"{selected_market['yes_ask']:.0%}"   if selected_market.get("yes_ask")   is not None else "N/A")
+                mc3.metric("Mid",      f"{selected_market['mid_price']:.0%}" if selected_market.get("mid_price") is not None else "N/A")
+                mc4.metric("Spread",   f"{selected_market['spread_est']:.0%}" if selected_market.get("spread_est") is not None else "N/A")
+                mc5.metric("Volume",   f"{selected_market.get('volume', 0):,}")
+                mc6.metric("Closes",   selected_market["close_time"][:10] if selected_market.get("close_time") else "N/A")
 
                 if ob:
-                    st.markdown("**📒 Live Orderbook (Top of Book)**")
-                    ob1, ob2, ob3, ob4 = st.columns(4)
-                    ob1.metric("Best YES Bid", f"{ob['best_yes_bid']:.2%}" if ob.get("best_yes_bid") is not None else "N/A")
-                    ob2.metric("Implied YES Ask", f"{ob['implied_yes_ask']:.2%}" if ob.get("implied_yes_ask") is not None else "N/A")
-                    ob3.metric("Mid Price", f"{ob['mid_price']:.2%}" if ob.get("mid_price") is not None else "N/A")
-                    ob4.metric("Spread", f"{ob['spread']:.2%}" if ob.get("spread") is not None else "N/A")
-
-                    with st.expander("📊 Full Orderbook Depth (Top 5)"):
+                    with st.expander("📊 Orderbook Depth (Top 5)"):
                         d1, d2 = st.columns(2)
                         with d1:
                             st.markdown("**YES Bids**")
@@ -278,59 +254,78 @@ if "gas_markets" in st.session_state:
                             for row in ob.get("no_depth", []):
                                 st.markdown(f"- {row[0]}¢ × {row[1]} contracts")
 
-# --- Market Input (auto-filled from selection) ---
+# --- Market Input ---
 st.subheader("📋 Market Input")
 
 sel_market = st.session_state.get("selected_market", {})
-sel_ob = st.session_state.get("selected_orderbook", {})
+sel_ob     = st.session_state.get("selected_orderbook", {})
 
-default_title = sel_market.get("title", "")
-default_yes = float(sel_market["yes_price"]) if isinstance(sel_market.get("yes_price"), (int, float)) else 0.45
-default_spread = (
-    float(sel_ob["spread"]) if sel_ob and isinstance(sel_ob.get("spread"), (int, float))
-    else float(sel_market.get("spread_est") or 0.02)
-)
+default_title  = sel_market.get("title", "")
+default_mid    = float(sel_market["mid_price"])  if isinstance(sel_market.get("mid_price"),  (int, float)) else 0.50
+default_spread = float(sel_market["spread_est"]) if isinstance(sel_market.get("spread_est"), (int, float)) else 0.05
 
 col1, col2 = st.columns(2)
 with col1:
-    title = st.text_input("Market Title", value=default_title, placeholder="Will national gas prices exceed $3.50?")
+    title = st.text_input(
+        "Market Title",
+        value=default_title,
+        placeholder="e.g. Will average gas prices be above $3.50?"
+    )
 with col2:
-    price = st.slider("Current YES Price", min_value=0.01, max_value=0.99, value=min(max(default_yes, 0.01), 0.99), step=0.01)
+    price = st.slider(
+        "Current YES Price (Mid)",
+        min_value=0.01, max_value=0.99,
+        value=min(max(round(default_mid, 2), 0.01), 0.99),
+        step=0.01
+    )
 
-spread = st.number_input(
+spread_input = st.number_input(
     "Bid-Ask Spread",
-    min_value=0.0, max_value=0.20,
-    value=min(max(default_spread, 0.0), 0.20),
+    min_value=0.0, max_value=0.50,
+    value=min(max(round(default_spread, 2), 0.0), 0.50),
     step=0.01, format="%.2f",
-    help="Auto-filled from live orderbook. You can override."
+    help="Auto-filled from live market data. You can override."
 )
 
-run = st.button("⚡ Calculate Edge", type="primary")
+# --- Debug Info ---
+with st.expander("🔧 Debug Info"):
+    st.write(f"**API Key loaded:** {api_key is not None}")
+    st.write(f"**Title:** `{title}`")
+    st.write(f"**Price:** `{price}`")
+    st.write(f"**Spread:** `{spread_input}`")
+    st.write(f"**Selected market in state:** {bool(sel_market)}")
 
 # --- Run Algorithm ---
-if run:
+if st.button("⚡ Calculate Edge", type="primary"):
     if not api_key:
-        st.error("Missing FRED API key. Add it to `.streamlit/secrets.toml` as `FRED_API_KEY`.")
-    elif not title:
-        st.error("Please enter a market title.")
+        st.error("❌ No FRED API key found. Add `FRED_API_KEY` to `.streamlit/secrets.toml`.")
+    elif not title.strip():
+        st.warning("⚠️ Please enter a Market Title or select a market from the table above.")
     else:
         with st.spinner("Fetching FRED data and calculating edge..."):
             try:
-                algo = ProGasAlgo(fred_api_key=api_key)
+                algo    = ProGasAlgo(fred_api_key=api_key)
                 signals = algo.refresh_data(force=force_refresh)
-                edge = algo.edge(title, price)
 
+                if not signals:
+                    st.error("❌ FRED data fetch returned empty. Check your API key and internet connection.")
+                    st.stop()
+
+                edge = algo.edge(title.strip(), price)
+
+                # --- Edge Result ---
                 st.subheader("📊 Edge Result")
                 r1, r2, r3 = st.columns(3)
-                r1.metric("Market YES Price", f"{price:.2%}")
-                r2.metric("Calculated Edge", f"{edge:+.2%}")
+                r1.metric("Market YES Price (Mid)", f"{price:.2%}")
+                r2.metric("Calculated Edge",        f"{edge:+.2%}")
                 fair_value = max(0.0, min(1.0, price + edge))
-                r3.metric("Implied Fair Value", f"{fair_value:.2%}")
+                r3.metric("Implied Fair Value",     f"{fair_value:.2%}")
 
+                # --- Decision Helper ---
                 st.subheader("🎯 Decision Helper")
                 signal_score = 0
                 reasons: list[str] = []
-                risks: list[str] = []
+                risks:   list[str] = []
 
                 if edge >= 0.10:
                     signal_score += 3
@@ -344,23 +339,24 @@ if run:
                 else:
                     risks.append("Negative edge — market appears overpriced vs model")
 
-                if edge > 0 and spread > 0:
-                    if edge >= 2 * spread:
+                if edge > 0 and spread_input > 0:
+                    if edge >= 2 * spread_input:
                         signal_score += 2
-                        reasons.append(f"Edge ({edge:.1%}) is ≥2× the spread ({spread:.1%})")
-                    elif edge >= spread:
+                        reasons.append(f"Edge ({edge:.1%}) is ≥2× the spread ({spread_input:.1%})")
+                    elif edge >= spread_input:
                         signal_score += 1
-                        reasons.append(f"Edge ({edge:.1%}) covers the spread ({spread:.1%})")
+                        reasons.append(f"Edge ({edge:.1%}) covers the spread ({spread_input:.1%})")
                     else:
-                        risks.append(f"Edge ({edge:.1%}) < spread ({spread:.1%}) — transaction cost likely dominates")
+                        risks.append(f"Edge ({edge:.1%}) < spread ({spread_input:.1%}) — transaction cost likely dominates")
 
                 wti = signals.get("wti", {})
                 if wti.get("current_wti") is not None:
-                    if wti.get("wti_change", 0) > 0.02:
+                    wti_chg = wti.get("wti_change", 0)
+                    if wti_chg > 0.02:
                         signal_score += 1
-                        reasons.append(f"WTI rising ({wti.get('wti_change'):+.1%}) — bullish tailwind")
-                    elif wti.get("wti_change", 0) < -0.02:
-                        risks.append(f"WTI falling ({wti.get('wti_change'):+.1%}) — bearish headwind")
+                        reasons.append(f"WTI rising ({wti_chg:+.1%}) — bullish tailwind")
+                    elif wti_chg < -0.02:
+                        risks.append(f"WTI falling ({wti_chg:+.1%}) — bearish headwind")
 
                 inv = signals.get("inventory", {})
                 if inv.get("current") is not None:
@@ -391,13 +387,14 @@ if run:
 
                 if reasons:
                     st.markdown("**✅ Supporting Factors:**")
-                    for r in reasons:
-                        st.markdown(f"- {r}")
+                    for reason in reasons:
+                        st.markdown(f"- {reason}")
                 if risks:
                     st.markdown("**⚠️ Risk Factors:**")
-                    for r in risks:
-                        st.markdown(f"- {r}")
+                    for risk in risks:
+                        st.markdown(f"- {risk}")
 
+                # --- Signal Breakdown ---
                 st.subheader("🔍 Signal Breakdown")
                 c1, c2, c3 = st.columns(3)
 
@@ -405,20 +402,20 @@ if run:
                     st.markdown("**💰 Gas Price Momentum**")
                     gm = signals.get("gas_momentum", {})
                     if gm.get("current") is not None:
-                        st.metric("Current Price", f"${gm['current']:.3f}/gal")
-                        st.metric("4-Week Momentum", f"{gm.get('momentum', 0):+.2%}")
-                        st.metric("12-Week Trend", f"{gm.get('trend', 0):+.2%}")
-                        st.metric("52-Week Avg", f"${gm.get('avg_52w', 0):.3f}/gal")
+                        st.metric("Current Price",    f"${gm['current']:.3f}/gal")
+                        st.metric("4-Week Momentum",  f"{gm.get('momentum', 0):+.2%}")
+                        st.metric("12-Week Trend",    f"{gm.get('trend', 0):+.2%}")
+                        st.metric("52-Week Avg",      f"${gm.get('avg_52w', 0):.3f}/gal")
                     else:
                         st.warning("Gas momentum data unavailable")
 
                 with c2:
                     st.markdown("**🛢️ WTI Crude Oil**")
                     if wti.get("current_wti") is not None:
-                        st.metric("Current WTI", f"${wti.get('current_wti', 0):.2f}/bbl")
-                        st.metric("Lagged WTI", f"${wti.get('lagged_wti', 0):.2f}/bbl")
-                        st.metric("WTI Change", f"{wti.get('wti_change', 0):+.2%}")
-                        st.metric("Optimal Lag", f"{wti.get('optimal_lag', 1)} week(s)")
+                        st.metric("Current WTI",  f"${wti.get('current_wti', 0):.2f}/bbl")
+                        st.metric("Lagged WTI",   f"${wti.get('lagged_wti', 0):.2f}/bbl")
+                        st.metric("WTI Change",   f"{wti.get('wti_change', 0):+.2%}")
+                        st.metric("Optimal Lag",  f"{wti.get('optimal_lag', 1)} week(s)")
                     else:
                         st.warning("WTI data unavailable")
 
@@ -427,43 +424,46 @@ if run:
                     ref = signals.get("refinery", {})
                     if inv.get("current") is not None:
                         st.metric("Inventory Status", inv.get("status"))
-                        st.metric("Z-Score", f"{inv.get('z_score', 0):.2f}")
-                        st.metric("WoW Change", f"{inv.get('wow_change', 0):+.2%}")
+                        st.metric("Z-Score",          f"{inv.get('z_score', 0):.2f}")
+                        st.metric("WoW Change",        f"{inv.get('wow_change', 0):+.2%}")
                     else:
                         st.warning("Inventory data unavailable")
                     if ref.get("current") is not None:
-                        st.metric("Refinery Util.", f"{ref.get('current', 0):.1f}%")
-                        st.metric("Refinery Status", ref.get("status", "unknown"))
+                        st.metric("Refinery Util.",   f"{ref.get('current', 0):.1f}%")
+                        st.metric("Refinery Status",  ref.get("status", "unknown"))
                     else:
                         st.info(f"Refinery: {ref.get('status', 'Data unavailable')}")
 
+                # --- Seasonal ---
                 st.subheader("📅 Seasonal Adjustment")
                 s1, s2 = st.columns(2)
                 s1.metric("Multiplier", f"{sea.get('multiplier', 1.0):.3f}x")
-                s2.metric("Signal", f"{sea.get('signal', 0.0):+.3f}")
+                s2.metric("Signal",     f"{sea.get('signal', 0.0):+.3f}")
                 if sea.get("factors"):
                     st.markdown("**Active Factors:**")
                     for name, val in sea["factors"]:
                         st.markdown(f"- {name}: `{val:.2f}x`")
 
+                # --- Regional ---
                 st.subheader("🗺️ Regional PADD Prices")
                 reg = signals.get("regional", {})
                 if reg.get("regional_data"):
                     padd_labels = {
-                        "padd1": "East Coast", "padd2": "Midwest",
-                        "padd3": "Gulf Coast", "padd4": "Rocky Mountain", "padd5": "West Coast",
+                        "padd1": "East Coast",    "padd2": "Midwest",
+                        "padd3": "Gulf Coast",    "padd4": "Rocky Mountain",
+                        "padd5": "West Coast",
                     }
                     cols = st.columns(5)
                     for i, (padd, data) in enumerate(reg["regional_data"].items()):
                         cols[i].metric(padd_labels.get(padd, padd), f"${data.get('price', 0):.3f}")
                     if reg.get("weighted_avg") is not None:
-                        st.metric("Weighted Avg", f"${reg.get('weighted_avg', 0):.3f}/gal")
+                        st.metric("Weighted Avg",    f"${reg.get('weighted_avg', 0):.3f}/gal")
                     if reg.get("spread") is not None:
                         st.metric("Regional Spread", f"${reg.get('spread', 0):.3f}")
                 else:
                     st.warning("Regional data unavailable")
 
-            except ValueError as e:
-                st.error(f"Initialization error: {e}")
             except Exception as e:
-                st.error(f"Unexpected error: {e}")
+                st.error(f"❌ Error: {str(e)}")
+                with st.expander("🔧 Full Traceback"):
+                    st.code(traceback.format_exc())
