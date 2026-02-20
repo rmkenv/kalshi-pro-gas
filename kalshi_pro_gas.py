@@ -817,28 +817,3 @@ if __name__ == "__main__":
     print("  algo = ProGasAlgo()")
     print("  edge = algo.edge('Market title', 0.45)")
 
-## Installation and Usage
-
-After saving this file as `kalshi_pro_gas.py`, you can use it in your projects:
-
-# Import the algorithm
-from kalshi_pro_gas import ProGasAlgo
-
-# Initialize with your FRED API key
-algo = ProGasAlgo(fred_api_key='your_api_key_here')
-
-# Or use environment variable
-import os
-os.environ['FRED_API_KEY'] = 'your_api_key_here'
-algo = ProGasAlgo()
-
-# Refresh data
-signals = algo.refresh_data()
-
-# Calculate edge for a market
-edge = algo.edge(
-    title="Will national gas prices exceed $3.50?",
-    price=0.45
-)
-
-print(f"Edge: {edge:+.2%}")
