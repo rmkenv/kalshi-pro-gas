@@ -10,56 +10,89 @@ from kalshi_pro_gas import ProGasAlgo
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 
-def get_kalshi_market(series_ticker: str, status: str = "open") -> dict | None:
-    """Fetch first market for a series ticker."""
-    try:
-        r = requests.get(f"{BASE}/markets", params={"series_ticker": series_ticker, "status": status}, timeout=10)
-        r.raise_for_status()
-        markets = r.json().get("markets", [])
-        if not markets:
-            return None
-        m = markets[0]
-        yes_c = m.get("yes_price")
-        no_c = m.get("no_price")
-        yes_price = yes_c / 100.0 if isinstance(yes_c, (int, float)) else None
-        no_price = no_c / 100.0 if isinstance(no_c, (int, float)) else None
-        spread_est = abs(yes_price - (1.0 - no_price)) if yes_price is not None and no_price is not None else None
-        return {
-            "ticker": m.get("ticker"),
-            "title": m.get("title"),
-            "yes_price": yes_price,
-            "no_price": no_price,
-            "volume": m.get("volume"),
-            "open_interest": m.get("open_interest"),
-            "close_time": m.get("close_time"),
-            "spread_est": spread_est,
-        }
-    except Exception:
-        return None
+def search_kalshi_gas_markets() -> list[dict]:
+    """
+    Search all open Kalshi markets containing 'gas' in the title.
+    Uses cursor-based pagination to get all results.
+    """
+    results = []
+    cursor = None
+    seen_tickers = set()
+
+    # Search terms that cover gasoline markets
+    for term in ["gas", "gasoline", "fuel"]:
+        cursor = None
+        while True:
+            params = {"status": "open", "limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                r = requests.get(f"{BASE}/markets", params=params, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                markets = data.get("markets", [])
+
+                for m in markets:
+                    title = (m.get("title") or "").lower()
+                    ticker = m.get("ticker", "")
+                    series = (m.get("series_ticker") or "").lower()
+                    if (
+                        term in title or term in series or term in ticker.lower()
+                    ) and ticker not in seen_tickers:
+                        seen_tickers.add(ticker)
+                        yes_c = m.get("yes_price")
+                        no_c = m.get("no_price")
+                        yes_price = yes_c / 100.0 if isinstance(yes_c, (int, float)) else None
+                        no_price = no_c / 100.0 if isinstance(no_c, (int, float)) else None
+                        spread_est = (
+                            abs(yes_price - (1.0 - no_price))
+                            if yes_price is not None and no_price is not None
+                            else None
+                        )
+                        results.append({
+                            "ticker": ticker,
+                            "series_ticker": m.get("series_ticker"),
+                            "title": m.get("title"),
+                            "yes_price": yes_price,
+                            "no_price": no_price,
+                            "spread_est": spread_est,
+                            "volume": m.get("volume"),
+                            "open_interest": m.get("open_interest"),
+                            "close_time": m.get("close_time"),
+                        })
+
+                cursor = data.get("cursor")
+                if not cursor or not markets:
+                    break
+            except Exception:
+                break
+
+    # Sort by volume descending
+    results.sort(key=lambda x: x.get("volume") or 0, reverse=True)
+    return results
 
 
 def get_kalshi_orderbook(market_ticker: str) -> dict | None:
-    """
-    Fetch live orderbook for a specific market ticker.
-    Returns best YES bid, best NO bid, mid price, and top-of-book spread.
-    Kalshi orderbook only returns BIDS (not asks) for both YES and NO sides.
-    """
+    """Fetch live orderbook for a specific market ticker."""
     try:
         r = requests.get(f"{BASE}/markets/{market_ticker}/orderbook", timeout=10)
         r.raise_for_status()
         ob = r.json().get("orderbook", {})
-
-        yes_bids = ob.get("yes", [])  # [[price_cents, qty], ...]
+        yes_bids = ob.get("yes", [])
         no_bids = ob.get("no", [])
-
         best_yes = yes_bids[0][0] / 100.0 if yes_bids else None
         best_no = no_bids[0][0] / 100.0 if no_bids else None
-
-        # In Kalshi binary markets: implied ask for YES = 1 - best NO bid
         implied_yes_ask = (1.0 - best_no) if best_no is not None else None
-        mid = ((best_yes + implied_yes_ask) / 2.0) if best_yes is not None and implied_yes_ask is not None else best_yes
-        spread = (implied_yes_ask - best_yes) if best_yes is not None and implied_yes_ask is not None else None
-
+        mid = (
+            (best_yes + implied_yes_ask) / 2.0
+            if best_yes is not None and implied_yes_ask is not None
+            else best_yes
+        )
+        spread = (
+            implied_yes_ask - best_yes
+            if best_yes is not None and implied_yes_ask is not None
+            else None
+        )
         return {
             "best_yes_bid": best_yes,
             "best_no_bid": best_no,
@@ -91,19 +124,19 @@ with st.sidebar:
     st.divider()
 
     st.header("📖 How This Works")
-
     st.markdown("""
-**Step 1 — Load a Kalshi Market**
+**Step 1 — Browse Gas Markets**
 
-Paste the series ticker from the Kalshi URL (e.g. `KXAAAGASM`) and click **Load from Kalshi**.
-The app pulls the live market title, YES price, and full orderbook automatically.
+Click **🔍 Find Open Gas Markets** to pull all open Kalshi markets
+related to gasoline/fuel. Select one from the table to auto-populate
+the inputs below.
 
 ---
 
 **Step 2 — Calculate Edge**
 
-Click **⚡ Calculate Edge**. The algorithm fetches live FRED economic data and runs a
-multi-factor model combining:
+Click **⚡ Calculate Edge**. The algorithm fetches live FRED data
+and runs a multi-factor model:
 
 | Signal | Weight |
 |---|---|
@@ -127,22 +160,22 @@ multi-factor model combining:
 
 **Step 4 — Decision Helper**
 
-The app scores the trade across 5 checks:
+Scores the trade across 5 checks:
 
 1. Edge strength (≥5% = good, ≥10% = strong)
-2. Edge vs bid-ask spread (edge must beat the spread to be worth it)
-3. WTI crude momentum (rising crude = bullish for gas)
-4. Inventory Z-score (low inventory = tight supply = bullish)
-5. Seasonal multiplier (summer driving season = bullish)
+2. Edge vs bid-ask spread
+3. WTI crude momentum
+4. Inventory Z-score
+5. Seasonal multiplier
 
-A score of **6+** = Strong Buy. **4+** = Buy. **2+** = Weak Buy. Below that = Pass.
+**6+** = Strong Buy · **4+** = Buy · **2+** = Weak Buy · **<2** = Pass
 
 ---
 
 **⚠️ Disclaimer**
 
-This is a quantitative model, not financial advice. Prediction markets carry risk.
-Always size positions appropriately and never trade more than you can afford to lose.
+Quantitative model only — not financial advice.
+Always size positions appropriately.
     """)
 
 
@@ -155,71 +188,100 @@ st.set_page_config(page_title="Pro Gas Algo", page_icon="⛽", layout="wide")
 st.title("⛽ Kalshi Pro Gas Algorithm")
 st.markdown("Multi-factor gas price prediction for Kalshi prediction markets — powered by FRED economic data.")
 
-# --- Market Auto-Load ---
-st.subheader("📌 Load Kalshi Market")
+# --- Market Browser ---
+st.subheader("🔍 Browse Open Gas Markets")
 
-colA, colB, colC = st.columns([2, 1, 1])
-with colA:
-    series_ticker = st.text_input("Series Ticker", value="KXAAAGASM", help="From the Kalshi URL: kalshi.com/markets/<ticker>/...")
-with colB:
-    status_filter = st.selectbox("Status", ["open", "all"], index=0)
-with colC:
-    st.write("")
-    st.write("")
-    load_market = st.button("🔗 Load from Kalshi", type="primary")
+if st.button("🔍 Find Open Gas Markets", type="primary"):
+    with st.spinner("Searching Kalshi for open gas/gasoline/fuel markets..."):
+        gas_markets = search_kalshi_gas_markets()
+    st.session_state["gas_markets"] = gas_markets
 
-market_data = None
-orderbook_data = None
-
-if load_market and series_ticker:
-    with st.spinner("Fetching market data from Kalshi..."):
-        market_data = get_kalshi_market(series_ticker, status=status_filter)
-        if market_data and market_data.get("ticker"):
-            orderbook_data = get_kalshi_orderbook(market_data["ticker"])
-
-    if market_data:
-        st.success(f"✅ Loaded: `{market_data['ticker']}` — {market_data.get('title', '')}")
-
-        # Show live market snapshot
-        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        mc1.metric("YES Price", f"{market_data['yes_price']:.2%}" if market_data.get("yes_price") is not None else "N/A")
-        mc2.metric("NO Price", f"{market_data['no_price']:.2%}" if market_data.get("no_price") is not None else "N/A")
-        mc3.metric("Volume", f"{market_data.get('volume', 'N/A'):,}" if isinstance(market_data.get("volume"), int) else "N/A")
-        mc4.metric("Open Interest", f"{market_data.get('open_interest', 'N/A'):,}" if isinstance(market_data.get("open_interest"), int) else "N/A")
-        mc5.metric("Closes", market_data.get("close_time", "N/A")[:10] if market_data.get("close_time") else "N/A")
-
-        # Orderbook
-        if orderbook_data:
-            st.markdown("**📒 Live Orderbook (Top of Book)**")
-            ob1, ob2, ob3, ob4 = st.columns(4)
-            ob1.metric("Best YES Bid", f"{orderbook_data['best_yes_bid']:.2%}" if orderbook_data.get("best_yes_bid") is not None else "N/A")
-            ob2.metric("Implied YES Ask", f"{orderbook_data['implied_yes_ask']:.2%}" if orderbook_data.get("implied_yes_ask") is not None else "N/A")
-            ob3.metric("Mid Price", f"{orderbook_data['mid_price']:.2%}" if orderbook_data.get("mid_price") is not None else "N/A")
-            ob4.metric("Spread", f"{orderbook_data['spread']:.2%}" if orderbook_data.get("spread") is not None else "N/A")
-
-            # Depth table
-            with st.expander("📊 Full Orderbook Depth (Top 5)"):
-                d1, d2 = st.columns(2)
-                with d1:
-                    st.markdown("**YES Bids**")
-                    for row in orderbook_data.get("yes_depth", []):
-                        st.markdown(f"- {row[0]}¢ × {row[1]} contracts")
-                with d2:
-                    st.markdown("**NO Bids**")
-                    for row in orderbook_data.get("no_depth", []):
-                        st.markdown(f"- {row[0]}¢ × {row[1]} contracts")
-        else:
-            st.info("Orderbook data unavailable for this market.")
+if "gas_markets" in st.session_state:
+    gas_markets = st.session_state["gas_markets"]
+    if not gas_markets:
+        st.warning("No open gas-related markets found on Kalshi right now.")
     else:
-        st.warning("No markets found. Try changing status to 'all' or check the ticker.")
+        st.success(f"Found **{len(gas_markets)}** open gas-related markets.")
 
-# --- Manual / Pre-filled Inputs ---
+        # Build display table
+        import pandas as pd
+        df = pd.DataFrame([
+            {
+                "Select": False,
+                "Ticker": m["ticker"],
+                "Title": m["title"],
+                "YES Price": f"{m['yes_price']:.2%}" if m.get("yes_price") is not None else "N/A",
+                "NO Price": f"{m['no_price']:.2%}" if m.get("no_price") is not None else "N/A",
+                "Est. Spread": f"{m['spread_est']:.2%}" if m.get("spread_est") is not None else "N/A",
+                "Volume": m.get("volume") or 0,
+                "Open Interest": m.get("open_interest") or 0,
+                "Closes": m["close_time"][:10] if m.get("close_time") else "N/A",
+            }
+            for m in gas_markets
+        ])
+
+        edited_df = st.data_editor(
+            df,
+            column_config={
+                "Select": st.column_config.CheckboxColumn("Select", help="Pick one market to analyze"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="market_table",
+        )
+
+        selected_rows = edited_df[edited_df["Select"] == True]
+        if len(selected_rows) > 1:
+            st.warning("Please select only one market at a time.")
+        elif len(selected_rows) == 1:
+            selected_ticker = selected_rows.iloc[0]["Ticker"]
+            selected_market = next((m for m in gas_markets if m["ticker"] == selected_ticker), None)
+
+            if selected_market:
+                st.session_state["selected_market"] = selected_market
+                with st.spinner(f"Fetching orderbook for {selected_ticker}..."):
+                    ob = get_kalshi_orderbook(selected_ticker)
+                st.session_state["selected_orderbook"] = ob
+                st.success(f"✅ Selected: `{selected_ticker}` — {selected_market.get('title')}")
+
+                # Live snapshot
+                mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+                mc1.metric("YES Price", f"{selected_market['yes_price']:.2%}" if selected_market.get("yes_price") is not None else "N/A")
+                mc2.metric("NO Price", f"{selected_market['no_price']:.2%}" if selected_market.get("no_price") is not None else "N/A")
+                mc3.metric("Volume", f"{selected_market.get('volume', 0):,}")
+                mc4.metric("Open Interest", f"{selected_market.get('open_interest', 0):,}")
+                mc5.metric("Closes", selected_market["close_time"][:10] if selected_market.get("close_time") else "N/A")
+
+                if ob:
+                    st.markdown("**📒 Live Orderbook (Top of Book)**")
+                    ob1, ob2, ob3, ob4 = st.columns(4)
+                    ob1.metric("Best YES Bid", f"{ob['best_yes_bid']:.2%}" if ob.get("best_yes_bid") is not None else "N/A")
+                    ob2.metric("Implied YES Ask", f"{ob['implied_yes_ask']:.2%}" if ob.get("implied_yes_ask") is not None else "N/A")
+                    ob3.metric("Mid Price", f"{ob['mid_price']:.2%}" if ob.get("mid_price") is not None else "N/A")
+                    ob4.metric("Spread", f"{ob['spread']:.2%}" if ob.get("spread") is not None else "N/A")
+
+                    with st.expander("📊 Full Orderbook Depth (Top 5)"):
+                        d1, d2 = st.columns(2)
+                        with d1:
+                            st.markdown("**YES Bids**")
+                            for row in ob.get("yes_depth", []):
+                                st.markdown(f"- {row[0]}¢ × {row[1]} contracts")
+                        with d2:
+                            st.markdown("**NO Bids**")
+                            for row in ob.get("no_depth", []):
+                                st.markdown(f"- {row[0]}¢ × {row[1]} contracts")
+
+# --- Market Input (auto-filled from selection) ---
 st.subheader("📋 Market Input")
 
-default_title = market_data["title"] if market_data and market_data.get("title") else ""
-default_yes = float(market_data["yes_price"]) if market_data and isinstance(market_data.get("yes_price"), (int, float)) else 0.45
-default_spread = float(orderbook_data["spread"]) if orderbook_data and isinstance(orderbook_data.get("spread"), (int, float)) else (
-    float(market_data["spread_est"]) if market_data and isinstance(market_data.get("spread_est"), (int, float)) else 0.02
+sel_market = st.session_state.get("selected_market", {})
+sel_ob = st.session_state.get("selected_orderbook", {})
+
+default_title = sel_market.get("title", "")
+default_yes = float(sel_market["yes_price"]) if isinstance(sel_market.get("yes_price"), (int, float)) else 0.45
+default_spread = (
+    float(sel_ob["spread"]) if sel_ob and isinstance(sel_ob.get("spread"), (int, float))
+    else float(sel_market.get("spread_est") or 0.02)
 )
 
 col1, col2 = st.columns(2)
@@ -233,7 +295,7 @@ spread = st.number_input(
     min_value=0.0, max_value=0.20,
     value=min(max(default_spread, 0.0), 0.20),
     step=0.01, format="%.2f",
-    help="Auto-filled from live orderbook if available. You can override."
+    help="Auto-filled from live orderbook. You can override."
 )
 
 run = st.button("⚡ Calculate Edge", type="primary")
@@ -251,7 +313,6 @@ if run:
                 signals = algo.refresh_data(force=force_refresh)
                 edge = algo.edge(title, price)
 
-                # --- Edge Result ---
                 st.subheader("📊 Edge Result")
                 r1, r2, r3 = st.columns(3)
                 r1.metric("Market YES Price", f"{price:.2%}")
@@ -259,9 +320,7 @@ if run:
                 fair_value = max(0.0, min(1.0, price + edge))
                 r3.metric("Implied Fair Value", f"{fair_value:.2%}")
 
-                # --- Decision Helper ---
                 st.subheader("🎯 Decision Helper")
-
                 signal_score = 0
                 reasons: list[str] = []
                 risks: list[str] = []
@@ -279,7 +338,7 @@ if run:
                     risks.append("Negative edge — market appears overpriced vs model")
 
                 if edge > 0 and spread > 0:
-                    if edge >= 2  spread:
+                    if edge >= 2 * spread:
                         signal_score += 2
                         reasons.append(f"Edge ({edge:.1%}) is ≥2× the spread ({spread:.1%})")
                     elif edge >= spread:
@@ -292,7 +351,7 @@ if run:
                 if wti.get("current_wti") is not None:
                     if wti.get("wti_change", 0) > 0.02:
                         signal_score += 1
-                        reasons.append(f"WTI rising ({wti.get('wti_change'):+.1%}) — bullish tailwind for gas")
+                        reasons.append(f"WTI rising ({wti.get('wti_change'):+.1%}) — bullish tailwind")
                     elif wti.get("wti_change", 0) < -0.02:
                         risks.append(f"WTI falling ({wti.get('wti_change'):+.1%}) — bearish headwind")
 
@@ -301,9 +360,9 @@ if run:
                     z = inv.get("z_score", 0)
                     if z < -0.5:
                         signal_score += 1
-                        reasons.append(f"Inventory tight ({inv.get('status')}, Z={z:.2f}) — supply pressure")
+                        reasons.append(f"Inventory tight ({inv.get('status')}, Z={z:.2f})")
                     elif z > 0.5:
-                        risks.append(f"Inventory ample ({inv.get('status')}, Z={z:.2f}) — supply headwind")
+                        risks.append(f"Inventory ample ({inv.get('status')}, Z={z:.2f})")
 
                 sea = signals.get("seasonal", {})
                 if sea.get("multiplier") is not None:
@@ -327,13 +386,11 @@ if run:
                     st.markdown("**✅ Supporting Factors:**")
                     for r in reasons:
                         st.markdown(f"- {r}")
-
                 if risks:
                     st.markdown("**⚠️ Risk Factors:**")
                     for r in risks:
                         st.markdown(f"- {r}")
 
-                # --- Signal Breakdown ---
                 st.subheader("🔍 Signal Breakdown")
                 c1, c2, c3 = st.columns(3)
 
@@ -373,7 +430,6 @@ if run:
                     else:
                         st.info(f"Refinery: {ref.get('status', 'Data unavailable')}")
 
-                # --- Seasonal ---
                 st.subheader("📅 Seasonal Adjustment")
                 s1, s2 = st.columns(2)
                 s1.metric("Multiplier", f"{sea.get('multiplier', 1.0):.3f}x")
@@ -383,7 +439,6 @@ if run:
                     for name, val in sea["factors"]:
                         st.markdown(f"- {name}: `{val:.2f}x`")
 
-                # --- Regional ---
                 st.subheader("🗺️ Regional PADD Prices")
                 reg = signals.get("regional", {})
                 if reg.get("regional_data"):
