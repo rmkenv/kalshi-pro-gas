@@ -1,6 +1,6 @@
 import streamlit as st
 import os
-from kalshi-pro-gas import ProGas
+from kalshi_pro_gas import progas
 
 st.set_page_config(page_title="Pro Gas Algo", page_icon="⛽", layout="wide")
 
