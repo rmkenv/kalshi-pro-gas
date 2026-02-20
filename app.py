@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
-from kalshi_pro_gas import ProGasAlgo
+import pandas as pd
+from progas import ProGasAlgo
 
 
 # =========================
@@ -9,21 +10,24 @@ from kalshi_pro_gas import ProGasAlgo
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
+# Known Kalshi gas/fuel series tickers
+GAS_SERIES = [
+    "KXAAAGASM",    # AAA national average gas price (weekly)
+    "KXGASPRICES",  # fallback alias
+]
+
 
 def search_kalshi_gas_markets() -> list[dict]:
     """
-    Search all open Kalshi markets containing 'gas' in the title.
-    Uses cursor-based pagination to get all results.
+    Fetch all open markets across known gas-related Kalshi series tickers.
     """
     results = []
-    cursor = None
     seen_tickers = set()
 
-    # Search terms that cover gasoline markets
-    for term in ["gas", "gasoline", "fuel"]:
+    for series in GAS_SERIES:
         cursor = None
         while True:
-            params = {"status": "open", "limit": 100}
+            params = {"series_ticker": series, "status": "open", "limit": 100}
             if cursor:
                 params["cursor"] = cursor
             try:
@@ -33,33 +37,33 @@ def search_kalshi_gas_markets() -> list[dict]:
                 markets = data.get("markets", [])
 
                 for m in markets:
-                    title = (m.get("title") or "").lower()
                     ticker = m.get("ticker", "")
-                    series = (m.get("series_ticker") or "").lower()
-                    if (
-                        term in title or term in series or term in ticker.lower()
-                    ) and ticker not in seen_tickers:
-                        seen_tickers.add(ticker)
-                        yes_c = m.get("yes_price")
-                        no_c = m.get("no_price")
-                        yes_price = yes_c / 100.0 if isinstance(yes_c, (int, float)) else None
-                        no_price = no_c / 100.0 if isinstance(no_c, (int, float)) else None
-                        spread_est = (
-                            abs(yes_price - (1.0 - no_price))
-                            if yes_price is not None and no_price is not None
-                            else None
-                        )
-                        results.append({
-                            "ticker": ticker,
-                            "series_ticker": m.get("series_ticker"),
-                            "title": m.get("title"),
-                            "yes_price": yes_price,
-                            "no_price": no_price,
-                            "spread_est": spread_est,
-                            "volume": m.get("volume"),
-                            "open_interest": m.get("open_interest"),
-                            "close_time": m.get("close_time"),
-                        })
+                    if ticker in seen_tickers:
+                        continue
+                    seen_tickers.add(ticker)
+
+                    yes_c = m.get("yes_price")
+                    no_c = m.get("no_price")
+                    yes_price = yes_c / 100.0 if isinstance(yes_c, (int, float)) else None
+                    no_price = no_c / 100.0 if isinstance(no_c, (int, float)) else None
+                    spread_est = (
+                        abs(yes_price - (1.0 - no_price))
+                        if yes_price is not None and no_price is not None
+                        else None
+                    )
+                    results.append({
+                        "ticker": ticker,
+                        "series_ticker": m.get("series_ticker"),
+                        "title": m.get("title", "").replace("**", ""),
+                        "strike": m.get("floor_strike"),
+                        "yes_price": yes_price,
+                        "no_price": no_price,
+                        "spread_est": spread_est,
+                        "volume": m.get("volume"),
+                        "open_interest": m.get("open_interest"),
+                        "close_time": m.get("close_time"),
+                        "rules": m.get("rules_primary", ""),
+                    })
 
                 cursor = data.get("cursor")
                 if not cursor or not markets:
@@ -67,8 +71,8 @@ def search_kalshi_gas_markets() -> list[dict]:
             except Exception:
                 break
 
-    # Sort by volume descending
-    results.sort(key=lambda x: x.get("volume") or 0, reverse=True)
+    # Sort by strike price ascending (natural price ladder)
+    results.sort(key=lambda x: x.get("strike") or 0)
     return results
 
 
@@ -107,7 +111,14 @@ def get_kalshi_orderbook(market_ticker: str) -> dict | None:
 
 
 # =========================
-# Sidebar — How it works
+# Page Config (must be first st call)
+# =========================
+
+st.set_page_config(page_title="Pro Gas Algo", page_icon="⛽", layout="wide")
+
+
+# =========================
+# Sidebar
 # =========================
 
 with st.sidebar:
@@ -128,7 +139,7 @@ with st.sidebar:
 **Step 1 — Browse Gas Markets**
 
 Click **🔍 Find Open Gas Markets** to pull all open Kalshi markets
-related to gasoline/fuel. Select one from the table to auto-populate
+from known gas series tickers. Select one from the table to auto-populate
 the inputs below.
 
 ---
@@ -183,8 +194,6 @@ Always size positions appropriately.
 # Main App
 # =========================
 
-st.set_page_config(page_title="Pro Gas Algo", page_icon="⛽", layout="wide")
-
 st.title("⛽ Kalshi Pro Gas Algorithm")
 st.markdown("Multi-factor gas price prediction for Kalshi prediction markets — powered by FRED economic data.")
 
@@ -192,24 +201,23 @@ st.markdown("Multi-factor gas price prediction for Kalshi prediction markets —
 st.subheader("🔍 Browse Open Gas Markets")
 
 if st.button("🔍 Find Open Gas Markets", type="primary"):
-    with st.spinner("Searching Kalshi for open gas/gasoline/fuel markets..."):
+    with st.spinner("Fetching open markets from Kalshi gas series..."):
         gas_markets = search_kalshi_gas_markets()
     st.session_state["gas_markets"] = gas_markets
 
 if "gas_markets" in st.session_state:
     gas_markets = st.session_state["gas_markets"]
     if not gas_markets:
-        st.warning("No open gas-related markets found on Kalshi right now.")
+        st.warning("No open gas markets found. Kalshi may not have active gas markets right now.")
     else:
-        st.success(f"Found **{len(gas_markets)}** open gas-related markets.")
+        st.success(f"Found **{len(gas_markets)}** open gas markets.")
 
-        # Build display table
-        import pandas as pd
         df = pd.DataFrame([
             {
                 "Select": False,
                 "Ticker": m["ticker"],
                 "Title": m["title"],
+                "Strike": f"${m['strike']:.2f}" if m.get("strike") is not None else "N/A",
                 "YES Price": f"{m['yes_price']:.2%}" if m.get("yes_price") is not None else "N/A",
                 "NO Price": f"{m['no_price']:.2%}" if m.get("no_price") is not None else "N/A",
                 "Est. Spread": f"{m['spread_est']:.2%}" if m.get("spread_est") is not None else "N/A",
@@ -244,7 +252,6 @@ if "gas_markets" in st.session_state:
                 st.session_state["selected_orderbook"] = ob
                 st.success(f"✅ Selected: `{selected_ticker}` — {selected_market.get('title')}")
 
-                # Live snapshot
                 mc1, mc2, mc3, mc4, mc5 = st.columns(5)
                 mc1.metric("YES Price", f"{selected_market['yes_price']:.2%}" if selected_market.get("yes_price") is not None else "N/A")
                 mc2.metric("NO Price", f"{selected_market['no_price']:.2%}" if selected_market.get("no_price") is not None else "N/A")
