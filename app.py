@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
-from progas import ProGasAlgo
+from kalshi_pro_gas import ProGasAlgo
 
 
 # =========================
