@@ -6,7 +6,7 @@ import os
 import json
 from scipy import stats
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "RMK Solutions"
 
 # ============================================
@@ -138,8 +138,9 @@ class ProGasDataHub:
         else:
             trend = momentum
 
-        # Price momentum signal
-        signal = momentum * 0.5 + trend * 0.3
+        # Price momentum signal — weight recent 4w more heavily than 12w trend
+        # Rationale: 4w momentum is more actionable; 12w trend lags real conditions
+        signal = momentum * 0.70 + trend * 0.30
 
         return {
             'current': current,
@@ -294,8 +295,14 @@ class ProGasDataHub:
         else:
             z_score = 0
 
-        # Signal based on inventory deviation
+        # Signal based on inventory deviation + WoW trend component
+        # Low inventory (negative z) = bullish; high inventory = bearish
         signal = -z_score * 0.02
+
+        # Add week-over-week draw/build as secondary signal
+        if len(obs) >= 2:
+            wow = (obs[0]['value'] - obs[1]['value']) / obs[1]['value']
+            signal += -wow * 0.5  # inventory draw (negative wow) = bullish
 
         # Determine status
         if z_score < -1.5:
@@ -413,7 +420,11 @@ class WTILagModel:
         wti_change = (current_wti - lagged_wti) / lagged_wti if lagged_wti > 0 else 0
 
         # WTI signal: positive change = bullish for gas prices
-        signal = wti_change * 0.6
+        # Amplify bearish signal when WTI is falling — penalize YES bets harder
+        if wti_change < -0.005:
+            signal = wti_change * 1.0   # stronger bearish weight
+        else:
+            signal = wti_change * 0.6
 
         # Get trend
         if len(wti_history) >= 4:
@@ -543,6 +554,11 @@ class ProGasAlgo:
     Comprehensive multi-factor model for predicting gas price movements in
     Kalshi prediction markets using FRED economic data.
     """
+
+    # Kelly fraction — quarter Kelly to reduce variance and drawdown
+    # Backtest showed aggressive Kelly caused 25% max drawdown; 0.25 stabilizes it
+    KELLY_FRACTION = 0.25
+    KELLY_MAX_BET = 0.10   # Cap individual bet at 10% of bankroll
 
     def __init__(self, fred_api_key: Optional[str] = None):
         """
@@ -701,15 +717,35 @@ class ProGasAlgo:
         edge = max(-0.50, min(0.50, edge))
 
         # ── Backtest-derived filters ──────────────────────────────────────────
-        # YES bets with edge < 0.15 lose consistently (43% WR on YES overall).
-        # NO bets are profitable even at lower edges (70% WR). Skip weak YES.
-        if edge > 0 and edge < 0.15:
+
+        # Fix 1: Raise YES threshold to 0.20 — low-conviction YES bets lose consistently
+        if edge > 0 and edge < 0.20:
             return 0.0  # Not enough conviction to bet YES
 
-        # If combined signal is bearish (WTI down, momentum negative) but
-        # fair_value still nudges YES, trust the bearish signal and flip to NO.
+        # Fix 2: If combined signal is bearish but fair_value still nudges YES,
+        # trust the bearish signal and flip to NO.
         if edge > 0 and combined_signal < -0.02:
             edge = -abs(edge)  # Flip to NO signal
+
+        # Fix 3: Momentum conflict check — if 4w and 12w disagree in direction,
+        # reduce edge by 40% (conflicting signals = lower conviction)
+        momentum_data = signals['gas_momentum']
+        momentum_4w = momentum_data.get('momentum', 0)
+        trend_12w = momentum_data.get('trend', 0)
+        if momentum_4w != 0 and trend_12w != 0:
+            if (momentum_4w > 0) != (trend_12w > 0):  # Signs disagree
+                edge *= 0.60  # Reduce conviction by 40%
+                # Re-apply YES threshold after reduction
+                if 0 < edge < 0.20:
+                    return 0.0
+
+        # Fix 4: WTI bearish penalty — if WTI is falling and we're betting YES,
+        # cut edge by 50% (WTI is a leading indicator for gas prices)
+        wti_change = signals['wti'].get('wti_change', 0)
+        if wti_change < -0.005 and edge > 0:
+            edge *= 0.50
+            if edge < 0.20:
+                return 0.0  # Still not enough conviction after penalty
 
         return edge
 
