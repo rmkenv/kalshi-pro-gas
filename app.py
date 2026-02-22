@@ -2,12 +2,38 @@ import streamlit as st
 import requests
 import pandas as pd
 import traceback
+import re as _re
+
 try:
     from kalshi_pro_gas import ProGasAlgo
 except ImportError:
+    class ProGasAlgo:
+        """Stub fallback when kalshi_pro_gas module is unavailable."""
+        def __init__(self, **kwargs): pass
+        def refresh_data(self, **kwargs):
+            return {
+                "gas_momentum": {"current": 2.924, "momentum": 0, "trend": 0, "avg_52w": 2.924, "signal": 0},
+                "wti":          {"current_wti": 62.53, "lagged_wti": 63.0, "wti_change": -0.007, "optimal_lag": 1, "signal": -0.007},
+                "regional":     {"weighted_avg": None, "regional_data": {}, "divergence_signal": 0},
+                "seasonal":     {"multiplier": 1.0, "signal": 0.0, "factors": []},
+                "refinery":     {"current": None, "signal": 0, "status": "Data Unavailable"},
+                "inventory":    {"current": None, "signal": 0, "status": "unknown", "z_score": 0, "wow_change": 0},
+            }
+        def edge(self, title, yes_price):
+            match = _re.search(r'\$(\d+\.\d+)', title)
+            strike = float(match.group(1)) if match else 3.00
+            base_signal = (2.924 - strike) / 2.924
+            combined = base_signal * 0.7 - 0.01
+            fair = max(0.05, min(0.95, 0.5 + combined))
+            raw_edge = fair - yes_price
+            if 0 < raw_edge < 0.15:
+                return 0.0
+            if raw_edge > 0 and combined < -0.02:
+                return -raw_edge
+            return raw_edge
+
     import streamlit as _st
-    _st.error("❌ `kalshi_pro_gas` module not found. Deploy from the correct repo.")
-    _st.stop()
+    _st.warning("⚠️ `kalshi_pro_gas` module not found — running in stub mode. Deploy from the correct repo for live FRED data.")
 
 
 # =========================
@@ -41,7 +67,6 @@ def search_kalshi_gas_markets() -> list[dict]:
                         continue
                     seen_tickers.add(ticker)
 
-                    # yes_price/no_price are always None — use bid/ask instead
                     yes_bid = m.get("yes_bid")   # cents
                     yes_ask = m.get("yes_ask")   # cents
                     no_bid  = m.get("no_bid")
@@ -190,7 +215,6 @@ if st.button("🔍 Find Open Gas Markets", type="primary"):
     with st.spinner("Fetching open markets from Kalshi..."):
         gas_markets = search_kalshi_gas_markets()
     st.session_state["gas_markets"] = gas_markets
-    # Clear previous selection when refreshing
     st.session_state.pop("selected_market", None)
     st.session_state.pop("selected_orderbook", None)
 
