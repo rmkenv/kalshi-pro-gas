@@ -1,0 +1,33 @@
+name: Kalshi Gas Scanner
+
+on:
+  schedule:
+    # Runs every 15 minutes during US market hours (Mon–Fri, 8AM–8PM EST = 13:00–01:00 UTC)
+    - cron: '*/15 13-23 * * 1-5'
+    - cron: '*/15 0-1  * * 2-6'
+  workflow_dispatch:   # also lets you trigger it manually from GitHub UI
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests numpy pandas scipy -q
+
+      - name: Run scanner
+        env:
+          FRED_API_KEY:   ${{ secrets.FRED_API_KEY }}
+          FROM_EMAIL:     ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL:       ${{ secrets.TO_EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          MIN_EDGE:       "0.05"
+        run: python scanner.py
