@@ -2,7 +2,12 @@ import streamlit as st
 import requests
 import pandas as pd
 import traceback
-from kalshi_pro_gas import ProGasAlgo
+
+try:
+    from kalshi_pro_gas import ProGasAlgo
+except ImportError:
+    st.error("❌ `kalshi_pro_gas` module not found. Deploy from the correct repo.")
+    st.stop()
 
 
 # =========================
@@ -109,7 +114,11 @@ with st.sidebar:
     else:
         st.error("❌ Missing `FRED_API_KEY` in `.streamlit/secrets.toml`.")
 
-    force_refresh = st.button("🔄 Force Refresh FRED Data")
+    if st.button("🔄 Force Refresh FRED Data"):
+        st.session_state["force_refresh"] = True
+        st.success("✅ Will force refresh on next calculation.")
+
+    force_refresh = st.session_state.pop("force_refresh", False)
 
     st.divider()
     st.header("📖 How This Works")
@@ -128,12 +137,12 @@ and runs a multi-factor model:
 
 | Signal | Weight |
 |---|---|
-| Gas Price Momentum | 20% |
-| WTI Crude Oil (lagged) | 35% |
-| Refinery Utilization | 15% |
-| Inventory Levels | 15% |
+| Gas Price Momentum | 35% |
+| WTI Crude Oil (lagged) | 25% |
+| Inventory Levels | 20% |
+| Refinery Utilization | 10% |
 | Regional PADD Prices | 5% |
-| Seasonal Adjustment | 10% |
+| Seasonal Adjustment | 5% |
 
 ---
 
@@ -261,7 +270,8 @@ sel_market = st.session_state.get("selected_market", {})
 sel_ob     = st.session_state.get("selected_orderbook", {})
 
 default_title  = sel_market.get("title", "")
-default_mid    = float(sel_market["mid_price"])  if isinstance(sel_market.get("mid_price"),  (int, float)) else 0.50
+raw_mid        = sel_market.get("mid_price")
+default_mid    = float(raw_mid) if isinstance(raw_mid, (int, float)) and 0.01 <= raw_mid <= 0.99 else 0.50
 default_spread = float(sel_market["spread_est"]) if isinstance(sel_market.get("spread_est"), (int, float)) else 0.05
 
 col1, col2 = st.columns(2)
@@ -466,4 +476,89 @@ if st.button("⚡ Calculate Edge", type="primary"):
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
                 with st.expander("🔧 Full Traceback"):
-                    st.code(traceback.format_exc())
+                    st.code(traceback.format_exc())      value=min(max(round(default_mid, 2), 0.01), 0.99),
+        step=0.01
+    )
+
+spread_input = st.number_input(
+    "Bid-Ask Spread",
+    min_value=0.0, max_value=0.50,
+    value=min(max(round(default_spread, 2), 0.0), 0.50),
+    step=0.01, format="%.2f",
+    help="Auto-filled from live market data. You can override."
+)
+
+# --- Debug Info ---
+with st.expander("🔧 Debug Info"):
+    st.write(f"**API Key loaded:** {api_key is not None}")
+    st.write(f"**Title:** `{title}`")
+    st.write(f"**Price:** `{price}`")
+    st.write(f"**Spread:** `{spread_input}`")
+    st.write(f"**Selected market in state:** {bool(sel_market)}")
+
+# --- Run Algorithm ---
+if st.button("⚡ Calculate Edge", type="primary"):
+    if not api_key:
+        st.error("❌ No FRED API key found. Add `FRED_API_KEY` to `.streamlit/secrets.toml`.")
+    elif not title.strip():
+        st.warning("⚠️ Please enter a Market Title or select a market from the table above.")
+    else:
+        with st.spinner("Fetching FRED data and calculating edge..."):
+            try:
+                algo    = ProGasAlgo(fred_api_key=api_key)
+                signals = algo.refresh_data(force=force_refresh)
+
+                if not signals:
+                    st.error("❌ FRED data fetch returned empty. Check your API key and internet connection.")
+                    st.stop()
+
+                edge = algo.edge(title.strip(), price)
+
+                # --- Edge Result ---
+                st.subheader("📊 Edge Result")
+                r1, r2, r3 = st.columns(3)
+                r1.metric("Market YES Price (Mid)", f"{price:.2%}")
+                r2.metric("Calculated Edge",        f"{edge:+.2%}")
+                fair_value = max(0.0, min(1.0, price + edge))
+                r3.metric("Implied Fair Value",     f"{fair_value:.2%}")
+
+                # --- Decision Helper ---
+                st.subheader("🎯 Decision Helper")
+                signal_score = 0
+                reasons: list[str] = []
+                risks:   list[str] = []
+
+                if edge >= 0.10:
+                    signal_score += 3
+                    reasons.append("Strong positive edge (≥10%)")
+                elif edge >= 0.05:
+                    signal_score += 2
+                    reasons.append("Moderate positive edge (≥5%)")
+                elif edge > 0:
+                    signal_score += 1
+                    reasons.append("Weak positive edge (<5%)")
+                else:
+                    risks.append("Negative edge — market appears overpriced vs model")
+
+                if edge > 0 and spread_input > 0:
+                    if edge >= 2 * spread_input:
+                        signal_score += 2
+                        reasons.append(f"Edge ({edge:.1%}) is ≥2× the spread ({spread_input:.1%})")
+                    elif edge >= spread_input:
+                        signal_score += 1
+                        reasons.append(f"Edge ({edge:.1%}) covers the spread ({spread_input:.1%})")
+                    else:
+                        risks.append(f"Edge ({edge:.1%}) < spread ({spread_input:.1%}) — transaction cost likely dominates")
+
+                wti = signals.get("wti", {})
+                if wti.get("current_wti") is not None:
+                    wti_chg = wti.get("wti_change", 0)
+                    if wti_chg > 0.02:
+                        signal_score += 1
+                        reasons.append(f"WTI rising ({wti_chg:+.1%}) — bullish tailwind")
+                    elif wti_chg < -0.02:
+                        risks.append(f"WTI falling ({wti_chg:+.1%}) — bearish headwind")
+
+                inv = signals.get("inventory", {})
+                if inv.get("current") is not None:
+                    z = inv.get("z_sc
