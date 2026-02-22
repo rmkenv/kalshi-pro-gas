@@ -6,7 +6,7 @@ import os
 import json
 from scipy import stats
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __author__ = "RMK Solutions"
 
 # ============================================
@@ -19,60 +19,36 @@ class ProGasDataHub:
     Fetches and processes FRED data for comprehensive gas price modeling.
     """
 
-    # FRED Series IDs for gas market indicators
     SERIES_IDS = {
-        'gas_national': 'GASREGW',           # U.S. Regular All Formulations Retail Gasoline Prices - Weekly
-        'wti_crude': 'DCOILWTICO',           # Crude Oil Prices: West Texas Intermediate (WTI) - Daily
-        'gas_inventory': 'WGFUPUS2',         # Weekly U.S. Ending Stocks of Finished Motor Gasoline
-        'refinery_util': 'WPULEUS3',         # Weekly U.S. Percent Utilization of Refinery Operable Capacity
-
-        # PADD District Gas Prices (Regional) - Weekly prices in $/gallon
-        'padd1': 'GASREGCOVECW',             # East Coast (PADD 1)
-        'padd2': 'GASREGMWW',                # Midwest (PADD 2)
-        'padd3': 'GASREGGCW',                # Gulf Coast (PADD 3) (fixed)
-        'padd4': 'GASREGRMW',                # Rocky Mountain (PADD 4)
-        'padd5': 'GASREGREFWCW',             # West Coast (PADD 5)
+        'gas_national':  'GASREGW',       # U.S. Regular All Formulations Retail Gas - Weekly
+        'wti_crude':     'DCOILWTICO',    # WTI Crude Oil - Daily
+        'gas_inventory': 'WGFUPUS2',      # Weekly U.S. Ending Stocks of Finished Motor Gasoline
+        'refinery_util': 'WPULEUS3',      # Weekly U.S. Refinery Operable Capacity Utilization
+        'padd1':         'GASREGCOVECW',  # East Coast (PADD 1)
+        'padd2':         'GASREGMWW',     # Midwest (PADD 2)
+        'padd3':         'GASREGGCW',     # Gulf Coast (PADD 3)
+        'padd4':         'GASREGRMW',     # Rocky Mountain (PADD 4)
+        'padd5':         'GASREGREFWCW',  # West Coast (PADD 5)
     }
 
-    # PADD District population weights (2020 Census estimates)
     PADD_WEIGHTS = {
-        'padd1': 0.18,   # East Coast
-        'padd2': 0.21,   # Midwest
-        'padd3': 0.29,   # Gulf Coast
-        'padd4': 0.05,   # Rocky Mountain
-        'padd5': 0.27,   # West Coast
+        'padd1': 0.18,
+        'padd2': 0.21,
+        'padd3': 0.29,
+        'padd4': 0.05,
+        'padd5': 0.27,
     }
 
     def __init__(self, api_key: Optional[str] = None):
-        """
-        Initialize with FRED API key.
-        
-        Args:
-            api_key: FRED API key (optional, can use FRED_API_KEY environment variable)
-            
-        Raises:
-            ValueError: If no API key provided
-        """
         self.api_key = api_key or os.environ.get('FRED_API_KEY')
         if not self.api_key:
             raise ValueError(
                 "FRED API key required. Set FRED_API_KEY environment variable or pass api_key parameter.\n"
                 "Get your free API key at: https://fred.stlouisfed.org/docs/api/api_key.html"
             )
-        self.cache = {}  # Cache for API responses
+        self.cache = {}
 
     def fred_series(self, series_id: str, limit: int = 52) -> List[Dict]:
-        """
-        Fetch FRED time series data.
-
-        Args:
-            series_id: FRED series identifier
-            limit: Number of observations to fetch (default 52 for ~1 year of weekly data)
-
-        Returns:
-            List of observations with date and value
-        """
-        # Check cache first
         cache_key = f"{series_id}_{limit}"
         if cache_key in self.cache:
             return self.cache[cache_key]
@@ -102,7 +78,6 @@ class ProGasDataHub:
                     except (ValueError, KeyError):
                         continue
 
-            # Cache the results
             self.cache[cache_key] = observations
             return observations
 
@@ -111,35 +86,23 @@ class ProGasDataHub:
             return []
 
     def get_gas_price_momentum(self) -> Dict:
-        """
-        Fetch national gas price history and calculate momentum/trend signals.
-        
-        Returns:
-            Dictionary with current price, momentum, trend, and signal
-        """
         obs = self.fred_series(self.SERIES_IDS['gas_national'], limit=52)
         if not obs or len(obs) < 4:
-            return {'current': None, 'momentum': 0, 'trend': 0, 'signal': 0}
+            return {'current': None, 'momentum': 0, 'trend': 0, 'signal': 0, 'avg_52w': None}
 
         current = obs[0]['value']
         prices = [o['value'] for o in obs]
 
-        # Calculate momentum (4-week change)
-        if len(prices) >= 4:
-            four_week_ago = prices[3]
-            momentum = (current - four_week_ago) / four_week_ago if four_week_ago > 0 else 0
-        else:
-            momentum = 0
+        four_week_ago = prices[3]
+        momentum = (current - four_week_ago) / four_week_ago if four_week_ago > 0 else 0
 
-        # Calculate longer-term trend (12-week)
         if len(prices) >= 12:
             twelve_week_ago = prices[11]
             trend = (current - twelve_week_ago) / twelve_week_ago if twelve_week_ago > 0 else 0
         else:
             trend = momentum
 
-        # Price momentum signal — weight recent 4w more heavily than 12w trend
-        # Rationale: 4w momentum is more actionable; 12w trend lags real conditions
+        # Weight recent 4w momentum more heavily than 12w trend
         signal = momentum * 0.70 + trend * 0.30
 
         return {
@@ -151,24 +114,9 @@ class ProGasDataHub:
         }
 
     def get_wti_history(self, weeks: int = 8) -> List[Dict]:
-        """
-        Fetch WTI crude oil price history for lag analysis.
-        
-        Args:
-            weeks: Number of weeks of history to fetch
-            
-        Returns:
-            List of WTI price observations
-        """
         return self.fred_series(self.SERIES_IDS['wti_crude'], limit=weeks)
 
     def get_regional_prices(self) -> Dict:
-        """
-        Fetch PADD district gas prices and calculate regional signals.
-        
-        Returns:
-            Dictionary with regional price data and divergence signals
-        """
         regional_data = {}
         prices = []
         weights = []
@@ -176,28 +124,17 @@ class ProGasDataHub:
         for padd, series_id in self.SERIES_IDS.items():
             if not padd.startswith('padd'):
                 continue
-
             obs = self.fred_series(series_id, limit=4)
             if obs:
                 price = obs[0]['value']
-                regional_data[padd] = {
-                    'price': price,
-                    'weight': self.PADD_WEIGHTS[padd]
-                }
+                regional_data[padd] = {'price': price, 'weight': self.PADD_WEIGHTS[padd]}
                 prices.append(price)
                 weights.append(self.PADD_WEIGHTS[padd])
 
         if not prices:
-            return {
-                'weighted_avg': None,
-                'regional_data': {},
-                'divergence_signal': 0
-            }
+            return {'weighted_avg': None, 'regional_data': {}, 'divergence_signal': 0}
 
-        # Calculate population-weighted average
         weighted_avg = np.average(prices, weights=weights)
-
-        # Calculate regional divergence
         divergence = np.std(prices)
         divergence_signal = -divergence * 0.01
 
@@ -212,99 +149,61 @@ class ProGasDataHub:
         }
 
     def get_refinery_utilization(self) -> Dict:
-        """
-        Fetch U.S. refinery utilization rate.
-        
-        Returns:
-            Dictionary with utilization data and supply signals
-        """
         try:
             obs = self.fred_series(self.SERIES_IDS['refinery_util'], limit=12)
-        except:
+        except Exception:
             obs = []
 
         if not obs or len(obs) < 2:
             return {
-                'current': None,
-                'avg_12w': None,
-                'signal': 0,
-                'status': 'Data Unavailable',
-                'trend': 0,
-                'note': 'Refinery data requires EIA API (not in FRED)'
+                'current': None, 'avg_12w': None, 'signal': 0,
+                'status': 'Data Unavailable', 'trend': 0,
+                'note': 'Refinery utilization data unavailable from FRED'
             }
 
         current = obs[0]['value']
         values = [o['value'] for o in obs]
         avg_12w = np.mean(values)
 
-        # Signal calculation based on utilization levels
         if current >= 93:
-            signal = 0.05
-            status = 'Very Tight'
+            signal, status = 0.05, 'Very Tight'
         elif current >= 90:
-            signal = 0.03
-            status = 'Tight'
+            signal, status = 0.03, 'Tight'
         elif current >= 85:
-            signal = 0.0
-            status = 'Normal'
+            signal, status = 0.0, 'Normal'
         elif current >= 80:
-            signal = -0.02
-            status = 'Loose'
+            signal, status = -0.02, 'Loose'
         else:
-            signal = -0.04
-            status = 'Very Loose'
+            signal, status = -0.04, 'Very Loose'
 
-        # Add trend component
         recent_trend = 0
         if len(obs) >= 4:
             recent_trend = (obs[0]['value'] - obs[3]['value']) / obs[3]['value']
             signal += recent_trend * 0.5
 
-        return {
-            'current': current,
-            'avg_12w': avg_12w,
-            'signal': signal,
-            'status': status,
-            'trend': recent_trend
-        }
+        return {'current': current, 'avg_12w': avg_12w, 'signal': signal,
+                'status': status, 'trend': recent_trend}
 
     def get_inventory_levels(self) -> Dict:
-        """
-        Fetch U.S. gasoline inventory levels.
-        
-        Returns:
-            Dictionary with inventory data and supply/demand signals
-        """
         obs = self.fred_series(self.SERIES_IDS['gas_inventory'], limit=52)
         if not obs or len(obs) < 4:
-            return {
-                'current': None,
-                'avg_52w': None,
-                'signal': 0,
-                'status': 'unknown'
-            }
+            return {'current': None, 'avg_52w': None, 'signal': 0, 'status': 'unknown', 'wow_change': 0}
 
         current = obs[0]['value']
         values = [o['value'] for o in obs]
         avg_52w = np.mean(values)
         std_52w = np.std(values)
 
-        # Z-score: how many standard deviations from average
-        if std_52w > 0:
-            z_score = (current - avg_52w) / std_52w
-        else:
-            z_score = 0
+        z_score = (current - avg_52w) / std_52w if std_52w > 0 else 0
 
-        # Signal based on inventory deviation + WoW trend component
-        # Low inventory (negative z) = bullish; high inventory = bearish
+        # Low inventory = bullish; high inventory = bearish
         signal = -z_score * 0.02
 
-        # Add week-over-week draw/build as secondary signal
+        # WoW draw/build as secondary signal
         if len(obs) >= 2:
             wow = (obs[0]['value'] - obs[1]['value']) / obs[1]['value']
-            signal += -wow * 0.5  # inventory draw (negative wow) = bullish
+            signal += -wow * 0.5  # draw (negative wow) = bullish
 
-        # Determine status
         if z_score < -1.5:
             status = 'Very Low'
         elif z_score < -0.5:
@@ -316,19 +215,11 @@ class ProGasDataHub:
         else:
             status = 'Very High'
 
-        # Add inventory trend
-        if len(obs) >= 2:
-            wow_change = (obs[0]['value'] - obs[1]['value']) / obs[1]['value']
-        else:
-            wow_change = 0
+        wow_change = (obs[0]['value'] - obs[1]['value']) / obs[1]['value'] if len(obs) >= 2 else 0
 
         return {
-            'current': current,
-            'avg_52w': avg_52w,
-            'z_score': z_score,
-            'signal': signal,
-            'status': status,
-            'wow_change': wow_change
+            'current': current, 'avg_52w': avg_52w, 'z_score': z_score,
+            'signal': signal, 'status': status, 'wow_change': wow_change
         }
 
 
@@ -337,56 +228,28 @@ class ProGasDataHub:
 # ============================================
 
 class WTILagModel:
-    """
-    Adaptive lag correlation model for WTI crude oil as a leading indicator.
-    """
+    """Adaptive lag correlation model for WTI crude oil as a leading indicator."""
 
     def __init__(self, data_hub: ProGasDataHub):
-        """
-        Initialize WTI lag model.
-        
-        Args:
-            data_hub: ProGasDataHub instance for data access
-        """
         self.data_hub = data_hub
-        self.optimal_lag = 1  # Default 1 week lag
+        self.optimal_lag = 1
 
     def calculate_optimal_lag(self, gas_prices: List[float],
-                             wti_prices: List[float],
-                             max_lag: int = 4) -> int:
-        """
-        Determine optimal lag period by analyzing correlation.
-        
-        Args:
-            gas_prices: List of historical gas prices
-            wti_prices: List of historical WTI prices
-            max_lag: Maximum lag to test (weeks)
-            
-        Returns:
-            Optimal lag in weeks
-        """
+                              wti_prices: List[float], max_lag: int = 4) -> int:
         if len(gas_prices) < max_lag + 2 or len(wti_prices) < max_lag + 2:
             return 1
 
-        best_lag = 1
-        best_corr = -1
+        best_lag, best_corr = 1, -1
 
         for lag in range(1, max_lag + 1):
             if lag >= len(wti_prices):
                 continue
-
-            gas_aligned = gas_prices[:-lag] if lag > 0 else gas_prices
+            gas_aligned = gas_prices[:-lag]
             wti_lagged = wti_prices[lag:]
-
             min_len = min(len(gas_aligned), len(wti_lagged))
             if min_len < 3:
                 continue
-
-            gas_aligned = gas_aligned[:min_len]
-            wti_lagged = wti_lagged[:min_len]
-
-            corr = np.corrcoef(gas_aligned, wti_lagged)[0, 1]
-
+            corr = np.corrcoef(gas_aligned[:min_len], wti_lagged[:min_len])[0, 1]
             if corr > best_corr:
                 best_corr = corr
                 best_lag = lag
@@ -395,51 +258,29 @@ class WTILagModel:
         return best_lag
 
     def get_wti_signal(self) -> Dict:
-        """
-        Calculate WTI-based signal using optimal lag.
-        
-        Returns:
-            Dictionary with WTI prices, changes, and signal
-        """
         wti_history = self.data_hub.get_wti_history(weeks=8)
 
         if not wti_history or len(wti_history) < 3:
-            return {
-                'current_wti': None,
-                'lagged_wti': None,
-                'wti_change': 0,
-                'signal': 0,
-                'optimal_lag': self.optimal_lag
-            }
+            return {'current_wti': None, 'lagged_wti': None,
+                    'wti_change': 0, 'signal': 0, 'optimal_lag': self.optimal_lag}
 
         current_wti = wti_history[0]['value']
-
         lag_idx = min(self.optimal_lag, len(wti_history) - 1)
         lagged_wti = wti_history[lag_idx]['value']
-
         wti_change = (current_wti - lagged_wti) / lagged_wti if lagged_wti > 0 else 0
 
-        # WTI signal: positive change = bullish for gas prices
-        # Amplify bearish signal when WTI is falling — penalize YES bets harder
-        if wti_change < -0.005:
-            signal = wti_change * 1.0   # stronger bearish weight
-        else:
-            signal = wti_change * 0.6
+        # Amplify bearish signal when WTI is falling
+        signal = wti_change * 1.0 if wti_change < -0.005 else wti_change * 0.6
 
-        # Get trend
+        wti_trend = 0
         if len(wti_history) >= 4:
             recent_prices = [o['value'] for o in wti_history[:4]]
             wti_trend = (recent_prices[0] - recent_prices[-1]) / recent_prices[-1]
-        else:
-            wti_trend = 0
 
         return {
-            'current_wti': current_wti,
-            'lagged_wti': lagged_wti,
-            'wti_change': wti_change,
-            'wti_trend': wti_trend,
-            'signal': signal,
-            'optimal_lag': self.optimal_lag
+            'current_wti': current_wti, 'lagged_wti': lagged_wti,
+            'wti_change': wti_change, 'wti_trend': wti_trend,
+            'signal': signal, 'optimal_lag': self.optimal_lag
         }
 
 
@@ -448,95 +289,55 @@ class WTILagModel:
 # ============================================
 
 class SeasonalAdjustment:
-    """
-    Seasonal adjustment multipliers for gas price predictions.
-    """
+    """Seasonal adjustment multipliers for gas price predictions."""
 
     @staticmethod
     def get_seasonal_multiplier(date: Optional[datetime] = None) -> Dict:
-        """
-        Calculate seasonal adjustment multiplier based on date.
-        
-        Args:
-            date: Target date (defaults to current date)
-            
-        Returns:
-            Dictionary with multiplier, signal, and active factors
-        """
         if date is None:
             date = datetime.now()
 
-        month = date.month
-        day = date.day
-
+        month, day = date.month, date.day
         multiplier = 1.0
         factors = []
 
-        # Summer driving season (May-September)
         if month in [5, 6, 7, 8, 9]:
             if month == 5 and day < 25:
-                summer_factor = 1.03
+                sf = 1.03
             elif month in [6, 7]:
-                summer_factor = 1.12
+                sf = 1.12
             elif month == 8:
-                summer_factor = 1.08
+                sf = 1.08
             elif month == 9:
-                summer_factor = 1.02  # Late summer / early fall, still elevated
+                sf = 1.02
             else:
-                summer_factor = 1.05
-
-            multiplier *= summer_factor
-            factors.append(('Summer Driving', summer_factor))
-
-        # Winter heating season
+                sf = 1.05
+            multiplier *= sf
+            factors.append(('Summer Driving', sf))
         elif month in [12, 1, 2]:
-            winter_factor = 1.05
-            multiplier *= winter_factor
-            factors.append(('Winter Heating', winter_factor))
-
-        # Spring (refinery maintenance)
+            multiplier *= 1.05
+            factors.append(('Winter Heating', 1.05))
         elif month in [3, 4]:
-            spring_factor = 1.02
-            multiplier *= spring_factor
-            factors.append(('Spring Maintenance', spring_factor))
-
-        # Fall transition
+            multiplier *= 1.02
+            factors.append(('Spring Maintenance', 1.02))
         else:
-            fall_factor = 0.98
-            multiplier *= fall_factor
-            factors.append(('Fall Transition', fall_factor))
+            multiplier *= 0.98
+            factors.append(('Fall Transition', 0.98))
 
-        # Holiday travel adjustments
+        # Holiday adjustments
         if month == 11 and 22 <= day <= 28:
-            holiday_factor = 1.06
-            multiplier *= holiday_factor
-            factors.append(('Thanksgiving Travel', holiday_factor))
-
+            multiplier *= 1.06; factors.append(('Thanksgiving Travel', 1.06))
         if (month == 12 and day >= 20) or (month == 1 and day <= 2):
-            holiday_factor = 1.04
-            multiplier *= holiday_factor
-            factors.append(('Holiday Travel', holiday_factor))
-
+            multiplier *= 1.04; factors.append(('Holiday Travel', 1.04))
         if month == 5 and day >= 25:
-            holiday_factor = 1.08
-            multiplier *= holiday_factor
-            factors.append(('Memorial Day', holiday_factor))
-
+            multiplier *= 1.08; factors.append(('Memorial Day', 1.08))
         if month == 9 and day <= 7:
-            holiday_factor = 1.06
-            multiplier *= holiday_factor
-            factors.append(('Labor Day', holiday_factor))
-
+            multiplier *= 1.06; factors.append(('Labor Day', 1.06))
         if month == 7 and 1 <= day <= 7:
-            holiday_factor = 1.07
-            multiplier *= holiday_factor
-            factors.append(('Independence Day', holiday_factor))
-
-        signal = multiplier - 1.0
+            multiplier *= 1.07; factors.append(('Independence Day', 1.07))
 
         return {
             'multiplier': multiplier,
-            'signal': signal,
+            'signal': multiplier - 1.0,
             'factors': factors,
             'month': month,
             'is_peak_season': month in [6, 7, 8]
@@ -549,90 +350,74 @@ class SeasonalAdjustment:
 
 class ProGasAlgo:
     """
-    Professional Gas Price Prediction Algorithm.
-    
-    Comprehensive multi-factor model for predicting gas price movements in
-    Kalshi prediction markets using FRED economic data.
+    Professional Gas Price Prediction Algorithm v1.2.0
+
+    Multi-factor model for predicting gas price movements in Kalshi
+    prediction markets using FRED economic data.
+
+    Changelog v1.2.0:
+    - Raised YES minimum edge threshold to 0.20 (eliminates low-conviction losers)
+    - Rebalanced signal weights: more gas_momentum/inventory, less WTI/seasonal
+    - Added momentum conflict filter (4w vs 12w disagreement reduces conviction)
+    - Added WTI bearish penalty for YES bets
+    - Added bearish signal flip: if combined_signal < -0.02, flip YES to NO
+    - Reduced Kelly fraction to 0.25 (quarter Kelly) to control drawdown
+    - Fixed _simple_edge to use fair - price (not ratio)
     """
 
-    # Kelly fraction — quarter Kelly to reduce variance and drawdown
-    # Backtest showed aggressive Kelly caused 25% max drawdown; 0.25 stabilizes it
-    KELLY_FRACTION = 0.25
-    KELLY_MAX_BET = 0.10   # Cap individual bet at 10% of bankroll
+    KELLY_FRACTION = 0.25   # Quarter Kelly — controls variance/drawdown
+    KELLY_MAX_BET  = 0.10   # Cap individual bet at 10% of bankroll
 
     def __init__(self, fred_api_key: Optional[str] = None):
-        """
-        Initialize ProGasAlgo with data sources.
-        
-        Args:
-            fred_api_key: FRED API key (optional, can use environment variable)
-        """
         self.data_hub = ProGasDataHub(fred_api_key)
         self.wti_model = WTILagModel(self.data_hub)
         self.seasonal = SeasonalAdjustment()
         self.last_refresh = None
         self.cached_signals = None
+        self._last_combined_signal = 0.0
 
     def refresh_data(self, force: bool = False) -> Dict:
-        """
-        Refresh all gas market data and calculate signals.
-        
-        Data is cached for 1 hour by default.
-        
-        Args:
-            force: Force refresh even if cache is valid
-            
-        Returns:
-            Dictionary containing all calculated signals
-        """
-        # Cache for 1 hour
+        """Refresh all gas market data. Cached for 1 hour."""
         if not force and self.last_refresh:
-            time_since_refresh = datetime.now() - self.last_refresh
-            if time_since_refresh.total_seconds() < 3600:
+            if (datetime.now() - self.last_refresh).total_seconds() < 3600:
                 return self.cached_signals
 
         print("📊 Refreshing Pro Gas data...")
 
         gas_momentum = self.data_hub.get_gas_price_momentum()
-        wti = self.wti_model.get_wti_signal()
-        regional = self.data_hub.get_regional_prices()
-        seasonal = self.seasonal.get_seasonal_multiplier()
-        refinery = self.data_hub.get_refinery_utilization()
-        inventory = self.data_hub.get_inventory_levels()
+        wti          = self.wti_model.get_wti_signal()
+        regional     = self.data_hub.get_regional_prices()
+        seasonal     = self.seasonal.get_seasonal_multiplier()
+        refinery     = self.data_hub.get_refinery_utilization()
+        inventory    = self.data_hub.get_inventory_levels()
 
         signals = {
             'gas_momentum': gas_momentum,
-            'wti': wti,
-            'regional': regional,
-            'seasonal': seasonal,
-            'refinery': refinery,
-            'inventory': inventory,
-            'timestamp': datetime.now()
+            'wti':          wti,
+            'regional':     regional,
+            'seasonal':     seasonal,
+            'refinery':     refinery,
+            'inventory':    inventory,
+            'timestamp':    datetime.now()
         }
 
         self.last_refresh = datetime.now()
         self.cached_signals = signals
 
-        # Print summary
         print("  " + "=" * 70)
         if gas_momentum['current']:
             print(f"  💰 Gas Price: ${gas_momentum['current']:.3f}/gal")
             print(f"     • 4-week momentum: {gas_momentum['momentum']:+.1%}")
-            print(f"     • 12-week trend: {gas_momentum['trend']:+.1%}")
-
+            print(f"     • 12-week trend:   {gas_momentum['trend']:+.1%}")
         if wti['current_wti']:
-            print(f"  🛢️  WTI Crude: ${wti['current_wti']:.2f}/bbl")
-            print(f"     • Change: {wti['wti_change']:+.1%}")
-
+            print(f"  🛢️  WTI Crude: ${wti['current_wti']:.2f}/bbl  (Δ {wti['wti_change']:+.1%})")
         if refinery['current']:
-            print(f"  🏭 Refinery Utilization: {refinery['current']:.1f}% ({refinery['status']})")
+            print(f"  🏭 Refinery Util: {refinery['current']:.1f}% ({refinery['status']})")
         else:
-            print(f"  🏭 Refinery Utilization: {refinery['status']}")
-
+            print(f"  🏭 Refinery Util: {refinery['status']}")
         if inventory['current']:
-            print(f"  📦 Gasoline Inventory: {inventory['current']:.0f} ({inventory['status']})")
-
-        print(f"  📅 Seasonal: {seasonal['multiplier']:.2f}x multiplier")
+            print(f"  📦 Inventory: {inventory['current']:.0f} Mbbls ({inventory['status']})")
+        print(f"  📅 Seasonal: {seasonal['multiplier']:.3f}x")
         print("  " + "=" * 70)
 
         return signals
@@ -641,185 +426,139 @@ class ProGasAlgo:
              base_gas_price: float = 3.25,
              signal_weights: Optional[Dict] = None) -> float:
         """
-        Calculate edge for gas markets using comprehensive signal integration.
-        
+        Calculate edge for a gas prediction market.
+
         Args:
             title: Market title/question
-            price: Current market price (0-1 range)
-            base_gas_price: Base gas price assumption ($/gallon)
-            signal_weights: Optional custom signal weights dictionary
-            
-        Returns:
-            Edge as decimal (-1 to 1), where positive = underpriced, negative = overpriced
-            
-        Example:
-            edge = algo.edge("Will national gas prices exceed $3.50?", 0.45)
-        """
-        # Only analyze gas markets
-        if 'GAS' not in title.upper() and 'GASOLINE' not in title.upper():
-            return 0
+            price: Current market price (0–1)
+            base_gas_price: Fallback gas price if FRED unavailable
+            signal_weights: Optional override for signal weights
 
-        # Ensure fresh data
+        Returns:
+            Edge as decimal. Positive = underpriced (bet YES),
+            Negative = overpriced (bet NO), 0 = skip.
+        """
+        if 'GAS' not in title.upper() and 'GASOLINE' not in title.upper():
+            return 0.0
+
         signals = self.refresh_data()
         if not signals:
             return self._simple_edge(title, price, base_gas_price)
 
-        # Signal weights — rebalanced: less WTI dominance, more momentum+inventory
-        # Rationale: NO bets win 70% vs YES 43%, WTI bearish (-0.8%) was being
-        # overridden by seasonal/momentum. Boost gas_momentum and inventory weight.
+        # ── Signal weights (rebalanced v1.2.0) ───────────────────────────────
         if signal_weights is None:
             signal_weights = {
-                'gas_momentum': 0.35,   # was 0.20 — most reliable available signal
-                'wti': 0.25,            # was 0.35 — reduce; bearish WTI was ignored
-                'refinery': 0.10,       # was 0.15 — often unavailable, reduce weight
-                'inventory': 0.20,      # was 0.15 — good contrarian signal
-                'regional': 0.05,       # unchanged
-                'seasonal': 0.05,       # was 0.10 — seasonal was over-inflating YES
+                'gas_momentum': 0.35,  # ↑ most reliable real-time signal
+                'wti':          0.25,  # ↓ reduce; bearish WTI was being ignored
+                'inventory':    0.20,  # ↑ good contrarian signal
+                'refinery':     0.10,  # ↓ often unavailable
+                'regional':     0.05,
+                'seasonal':     0.05,  # ↓ was over-inflating YES bets
             }
 
-        # Extract signals
-        gas_momentum_signal = signals['gas_momentum']['signal']
-        wti_signal = signals['wti']['signal']
-        regional_signal = signals['regional']['divergence_signal']
-        seasonal_signal = signals['seasonal']['signal']
-        refinery_signal = signals['refinery']['signal']
-        inventory_signal = signals['inventory']['signal']
+        # ── Extract raw signals ───────────────────────────────────────────────
+        gas_sig      = signals['gas_momentum']['signal']
+        wti_sig      = signals['wti']['signal']
+        regional_sig = signals['regional']['divergence_signal']
+        seasonal_sig = signals['seasonal']['signal']
+        refinery_sig = signals['refinery']['signal']
+        inventory_sig = signals['inventory']['signal']
 
-        # Weighted combination
         combined_signal = (
-            gas_momentum_signal * signal_weights['gas_momentum'] +
-            wti_signal * signal_weights['wti'] +
-            refinery_signal * signal_weights['refinery'] +
-            inventory_signal * signal_weights['inventory'] +
-            regional_signal * signal_weights['regional'] +
-            seasonal_signal * signal_weights['seasonal']
+            gas_sig      * signal_weights['gas_momentum'] +
+            wti_sig      * signal_weights['wti'] +
+            refinery_sig * signal_weights['refinery'] +
+            inventory_sig * signal_weights['inventory'] +
+            regional_sig * signal_weights['regional'] +
+            seasonal_sig * signal_weights['seasonal']
         )
 
-        # Determine market direction
-        is_bullish_market = self._parse_market_direction(title)
-
-        # Store combined_signal on self for use in post-edge filters
         self._last_combined_signal = combined_signal
 
-        # Calculate fair value
-        fair_value = 0.50 + combined_signal
-
-        if not is_bullish_market:
-            fair_value = 0.50 - combined_signal
-
-        # Clamp fair value
+        # ── Fair value & raw edge ─────────────────────────────────────────────
+        is_bullish = self._parse_market_direction(title)
+        fair_value = 0.50 + combined_signal if is_bullish else 0.50 - combined_signal
         fair_value = max(0.10, min(0.90, fair_value))
 
-        # Calculate edge (standard prediction market convention: fair_value - price)
-        edge = fair_value - price
-
-        # Cap edge
-        edge = max(-0.50, min(0.50, edge))
+        edge = max(-0.50, min(0.50, fair_value - price))
 
         # ── Backtest-derived filters ──────────────────────────────────────────
 
-        # Fix 1: Raise YES threshold to 0.20 — low-conviction YES bets lose consistently
-        if edge > 0 and edge < 0.20:
-            return 0.0  # Not enough conviction to bet YES
+        # Filter 1: YES minimum threshold — low-conviction YES bets lose consistently
+        if 0 < edge < 0.20:
+            return 0.0
 
-        # Fix 2: If combined signal is bearish but fair_value still nudges YES,
-        # trust the bearish signal and flip to NO.
+        # Filter 2: Bearish signal override — trust combined signal over fair_value nudge
         if edge > 0 and combined_signal < -0.02:
-            edge = -abs(edge)  # Flip to NO signal
+            edge = -abs(edge)
 
-        # Fix 3: Momentum conflict check — if 4w and 12w disagree in direction,
-        # reduce edge by 40% (conflicting signals = lower conviction)
-        momentum_data = signals['gas_momentum']
-        momentum_4w = momentum_data.get('momentum', 0)
-        trend_12w = momentum_data.get('trend', 0)
+        # Filter 3: Momentum conflict — 4w and 12w disagree → reduce conviction 40%
+        momentum_4w = signals['gas_momentum'].get('momentum', 0)
+        trend_12w   = signals['gas_momentum'].get('trend', 0)
         if momentum_4w != 0 and trend_12w != 0:
-            if (momentum_4w > 0) != (trend_12w > 0):  # Signs disagree
-                edge *= 0.60  # Reduce conviction by 40%
-                # Re-apply YES threshold after reduction
+            if (momentum_4w > 0) != (trend_12w > 0):
+                edge *= 0.60
                 if 0 < edge < 0.20:
                     return 0.0
 
-        # Fix 4: WTI bearish penalty — if WTI is falling and we're betting YES,
-        # cut edge by 50% (WTI is a leading indicator for gas prices)
+        # Filter 4: WTI bearish penalty — falling WTI cuts YES conviction by 50%
         wti_change = signals['wti'].get('wti_change', 0)
         if wti_change < -0.005 and edge > 0:
             edge *= 0.50
             if edge < 0.20:
-                return 0.0  # Still not enough conviction after penalty
+                return 0.0
 
         return edge
 
     def _simple_edge(self, title: str, price: float, gas_price: float) -> float:
-        """
-        Fallback to simple model if Pro data unavailable.
-        
-        Args:
-            title: Market title
-            price: Current market price
-            gas_price: Current gas price
-            
-        Returns:
-            Simple edge calculation
-        """
-        fair_base = 0.48
+        """Fallback simple model when FRED data is unavailable."""
+        fair_base   = 0.48
         sensitivity = 0.12
-        ref_price = 3.0
-
-        fair = fair_base + (gas_price - ref_price) * sensitivity
-        fair = max(0.10, min(0.90, fair))
-        return fair - price  # consistent with main edge() convention
+        ref_price   = 3.0
+        fair = max(0.10, min(0.90, fair_base + (gas_price - ref_price) * sensitivity))
+        return fair - price
 
     def _parse_market_direction(self, title: str) -> bool:
         """
-        Determine if market is bullish or bearish from title.
-        Handles negation (e.g. "NOT exceed", "will NOT rise").
-        
-        Args:
-            title: Market title/question
-            
-        Returns:
-            True if bullish market, False if bearish
+        Determine if market is bullish (YES = price goes up) or bearish.
+        Handles negation: 'will NOT exceed', 'won't rise', etc.
+        Returns True for bullish, False for bearish.
         """
         import re
         t = title.upper()
 
-        bullish_keywords = ['ABOVE', 'OVER', 'EXCEED', 'RISE', 'INCREASE', 'HIGHER', 'UP']
-        bearish_keywords = ['BELOW', 'UNDER', 'DROP', 'FALL', 'DECREASE', 'LOWER', 'DOWN']
-
-        negation_pattern = re.compile(r'\bNOT\b|\bWON\'T\b|\bWILL NOT\b|\bFAIL TO\b')
+        bullish_kws = ['ABOVE', 'OVER', 'EXCEED', 'RISE', 'INCREASE', 'HIGHER', 'UP']
+        bearish_kws = ['BELOW', 'UNDER', 'DROP', 'FALL', 'DECREASE', 'LOWER', 'DOWN']
 
         def is_negated(keyword: str) -> bool:
-            """Check if a keyword is preceded by a negation within 3 words."""
             pattern = re.compile(
                 r'\b(?:NOT|WON\'T|WILL\s+NOT|FAIL\s+TO)\b\s+(?:\w+\s+){0,2}' + keyword
             )
             return bool(pattern.search(t))
 
-        for kw in bullish_keywords:
+        for kw in bullish_kws:
             if kw in t:
-                return False if is_negated(kw) else True
+                return not is_negated(kw)
 
-        for kw in bearish_keywords:
+        for kw in bearish_kws:
             if kw in t:
-                return True if is_negated(kw) else False
+                return is_negated(kw)
 
-        return True
+        return True  # Default: treat as bullish
 
     def get_diagnostics(self) -> Dict:
-        """
-        Get detailed diagnostics including all signals and cache status.
-        
-        Returns:
-            Dictionary with diagnostic information
-        """
+        """Return detailed diagnostics for debugging."""
         if not self.cached_signals:
             self.refresh_data()
-
         return {
-            'signals': self.cached_signals,
-            'last_refresh': self.last_refresh,
-            'wti_optimal_lag': self.wti_model.optimal_lag,
-            'cache_age_seconds': (datetime.now() - self.last_refresh).total_seconds() if self.last_refresh else None
+            'signals':          self.cached_signals,
+            'last_refresh':     self.last_refresh,
+            'wti_optimal_lag':  self.wti_model.optimal_lag,
+            'last_combined_signal': self._last_combined_signal,
+            'cache_age_seconds': (
+                (datetime.now() - self.last_refresh).total_seconds()
+                if self.last_refresh else None
+            )
         }
 
 
@@ -829,43 +568,35 @@ class ProGasAlgo:
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("KALSHI PRO GAS ALGORITHM - Gas Price Prediction System")
+    print("KALSHI PRO GAS ALGORITHM v1.2.0 — Gas Price Prediction System")
     print("=" * 80)
-    
-    # Initialize algorithm
-    print("\n🎛️ INITIALIZING...")
+
     try:
         algo = ProGasAlgo()
     except ValueError as e:
         print(f"\n❌ Error: {e}")
-        print("\nPlease set your FRED API key:")
+        print("\nSet your FRED API key:")
         print("  export FRED_API_KEY='your_api_key_here'")
         exit(1)
-    
-    # Refresh data
-    print("\n📊 REFRESHING DATA...")
+
     signals = algo.refresh_data()
-    
-    # Example edge calculation
-    print("\n💰 EXAMPLE EDGE CALCULATION:")
+
     example_title = "Will national gas prices exceed $3.50 by March 1?"
     example_price = 0.45
-    
     edge = algo.edge(example_title, example_price)
-    
+
     print(f"\nMarket: {example_title}")
-    print(f"Current Price: ${example_price:.2f}")
-    print(f"Calculated Edge: {edge:+.2%}")
-    
+    print(f"Price:  {example_price:.2f}")
+    print(f"Edge:   {edge:+.2%}")
+
     if edge > 0:
-        print("✅ Positive edge - market appears underpriced")
+        print("✅ Positive edge — market underpriced (bet YES)")
     elif edge < 0:
-        print("❌ Negative edge - market appears overpriced")
+        print("❌ Negative edge — market overpriced (bet NO)")
     else:
-        print("⚖️ Fair value - no clear edge")
-    
-    print("\n✅ Algorithm initialized successfully!")
-    print("\nUsage:")
+        print("⚖️  No edge — skip")
+
+    print("\n✅ Algorithm ready.")
     print("  from kalshi_pro_gas import ProGasAlgo")
     print("  algo = ProGasAlgo()")
     print("  edge = algo.edge('Market title', 0.45)")
