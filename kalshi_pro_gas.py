@@ -48,8 +48,8 @@ class ProGasDataHub:
             )
         self.cache = {}
 
-    def fred_series(self, series_id: str, limit: int = 52) -> List[Dict]:
-        cache_key = f"{series_id}_{limit}"
+    def fred_series(self, series_id: str, limit: int = 52, start_date: Optional[str] = '2022-01-01') -> List[Dict]:
+        cache_key = f"{series_id}_{limit}_{start_date}"
         if cache_key in self.cache:
             return self.cache[cache_key]
 
@@ -61,6 +61,8 @@ class ProGasDataHub:
             'sort_order': 'desc',
             'limit': limit
         }
+        if start_date:
+            params['observation_start'] = start_date
 
         try:
             response = requests.get(url, params=params, timeout=10)
@@ -355,7 +357,8 @@ class ProGasAlgo:
     Multi-factor model for predicting gas price movements in Kalshi
     prediction markets using FRED economic data.
 
-    Changelog v1.2.0:
+    Changelog v1.3.0:
+    - Filtered out COVID-era data (2020-2021) to focus on 2022–present regime
     - Raised YES minimum edge threshold to 0.20 (eliminates low-conviction losers)
     - Rebalanced signal weights: more gas_momentum/inventory, less WTI/seasonal
     - Added momentum conflict filter (4w vs 12w disagreement reduces conviction)
