@@ -23,8 +23,8 @@ class ProGasDataHub:
     SERIES_IDS = {
         'gas_national': 'GASREGW',           # U.S. Regular All Formulations Retail Gasoline Prices - Weekly
         'wti_crude': 'DCOILWTICO',           # Crude Oil Prices: West Texas Intermediate (WTI) - Daily
-        'gas_inventory': 'WGTSTUS1',         # Weekly U.S. Ending Stocks of Total Gasoline (fixed)
-        'refinery_util': 'WPRUR',            # Weekly U.S. Percent Utilization of Refinery Operable Capacity
+        'gas_inventory': 'WGFUPUS2',         # Weekly U.S. Ending Stocks of Finished Motor Gasoline
+        'refinery_util': 'WPULEUS3',         # Weekly U.S. Percent Utilization of Refinery Operable Capacity
 
         # PADD District Gas Prices (Regional) - Weekly prices in $/gallon
         'padd1': 'GASREGCOVECW',             # East Coast (PADD 1)
@@ -648,15 +648,17 @@ class ProGasAlgo:
         if not signals:
             return self._simple_edge(title, price, base_gas_price)
 
-        # Signal weights
+        # Signal weights — rebalanced: less WTI dominance, more momentum+inventory
+        # Rationale: NO bets win 70% vs YES 43%, WTI bearish (-0.8%) was being
+        # overridden by seasonal/momentum. Boost gas_momentum and inventory weight.
         if signal_weights is None:
             signal_weights = {
-                'gas_momentum': 0.20,
-                'wti': 0.35,
-                'refinery': 0.15,
-                'inventory': 0.15,
-                'regional': 0.05,
-                'seasonal': 0.10
+                'gas_momentum': 0.35,   # was 0.20 — most reliable available signal
+                'wti': 0.25,            # was 0.35 — reduce; bearish WTI was ignored
+                'refinery': 0.10,       # was 0.15 — often unavailable, reduce weight
+                'inventory': 0.20,      # was 0.15 — good contrarian signal
+                'regional': 0.05,       # unchanged
+                'seasonal': 0.05,       # was 0.10 — seasonal was over-inflating YES
             }
 
         # Extract signals
@@ -680,6 +682,9 @@ class ProGasAlgo:
         # Determine market direction
         is_bullish_market = self._parse_market_direction(title)
 
+        # Store combined_signal on self for use in post-edge filters
+        self._last_combined_signal = combined_signal
+
         # Calculate fair value
         fair_value = 0.50 + combined_signal
 
@@ -694,6 +699,17 @@ class ProGasAlgo:
 
         # Cap edge
         edge = max(-0.50, min(0.50, edge))
+
+        # ── Backtest-derived filters ──────────────────────────────────────────
+        # YES bets with edge < 0.15 lose consistently (43% WR on YES overall).
+        # NO bets are profitable even at lower edges (70% WR). Skip weak YES.
+        if edge > 0 and edge < 0.15:
+            return 0.0  # Not enough conviction to bet YES
+
+        # If combined signal is bearish (WTI down, momentum negative) but
+        # fair_value still nudges YES, trust the bearish signal and flip to NO.
+        if edge > 0 and combined_signal < -0.02:
+            edge = -abs(edge)  # Flip to NO signal
 
         return edge
 
@@ -714,7 +730,8 @@ class ProGasAlgo:
         ref_price = 3.0
 
         fair = fair_base + (gas_price - ref_price) * sensitivity
-        return (fair - price) / price if price > 0 else 0
+        fair = max(0.10, min(0.90, fair))
+        return fair - price  # consistent with main edge() convention
 
     def _parse_market_direction(self, title: str) -> bool:
         """
@@ -816,4 +833,3 @@ if __name__ == "__main__":
     print("  from kalshi_pro_gas import ProGasAlgo")
     print("  algo = ProGasAlgo()")
     print("  edge = algo.edge('Market title', 0.45)")
-
