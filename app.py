@@ -3,13 +3,13 @@ import requests
 import pandas as pd
 import traceback
 import re as _re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from datetime import datetime, timezone
 
 try:
     from kalshi_pro_gas import ProGasAlgo
 except ImportError:
     class ProGasAlgo:
-        """Stub fallback when kalshi_pro_gas module is unavailable."""
         def __init__(self, **kwargs): pass
         def refresh_data(self, **kwargs):
             return {
@@ -37,17 +37,20 @@ except ImportError:
     _st.warning("⚠️ `kalshi_pro_gas` module not found — running in stub mode.")
 
 
-# =========================
-# Kalshi API helpers
-# =========================
-
-BASE = "https://api.elections.kalshi.com/trade-api/v2"
+# ─────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────
+BASE       = "https://api.elections.kalshi.com/trade-api/v2"
 GAS_SERIES = ["KXAAAGASM", "KXAAAGASW", "KXAAGASM", "KXAAGASW"]
+AUTO_REFRESH_INTERVAL = 15 * 60  # 15 minutes in seconds
 
+
+# ─────────────────────────────────────────
+# Kalshi helpers
+# ─────────────────────────────────────────
 
 def search_kalshi_gas_markets() -> list[dict]:
-    results = []
-    seen_tickers = set()
+    results, seen = [], set()
     for series in GAS_SERIES:
         cursor = None
         while True:
@@ -57,27 +60,27 @@ def search_kalshi_gas_markets() -> list[dict]:
             try:
                 r = requests.get(f"{BASE}/markets", params=params, timeout=10)
                 r.raise_for_status()
-                data = r.json()
+                data    = r.json()
                 markets = data.get("markets", [])
                 for m in markets:
                     ticker = m.get("ticker", "")
-                    if ticker in seen_tickers:
+                    if ticker in seen:
                         continue
-                    seen_tickers.add(ticker)
+                    seen.add(ticker)
                     yes_bid = m.get("yes_bid")
                     yes_ask = m.get("yes_ask")
-                    yes_bid_f  = yes_bid  / 100.0 if isinstance(yes_bid,  (int, float)) else None
-                    yes_ask_f  = yes_ask  / 100.0 if isinstance(yes_ask,  (int, float)) else None
-                    mid_price  = (yes_bid_f + yes_ask_f) / 2.0 if yes_bid_f and yes_ask_f else None
-                    spread_est = (yes_ask_f - yes_bid_f)        if yes_bid_f and yes_ask_f else None
+                    yb = yes_bid / 100.0 if isinstance(yes_bid, (int, float)) else None
+                    ya = yes_ask / 100.0 if isinstance(yes_ask, (int, float)) else None
+                    mid    = (yb + ya) / 2.0 if yb and ya else None
+                    spread = (ya - yb)        if yb and ya else None
                     results.append({
                         "ticker":        ticker,
                         "title":         m.get("title", "").replace("**", ""),
                         "strike":        m.get("floor_strike"),
-                        "yes_bid":       yes_bid_f,
-                        "yes_ask":       yes_ask_f,
-                        "mid_price":     mid_price,
-                        "spread_est":    spread_est,
+                        "yes_bid":       yb,
+                        "yes_ask":       ya,
+                        "mid_price":     mid,
+                        "spread_est":    spread,
                         "last_price":    m.get("last_price", 0) / 100.0 if m.get("last_price") else None,
                         "volume":        m.get("volume"),
                         "open_interest": m.get("open_interest"),
@@ -87,15 +90,15 @@ def search_kalshi_gas_markets() -> list[dict]:
                 if not cursor or not markets:
                     break
             except Exception as e:
-                st.warning(f"Error fetching series {series}: {e}")
+                st.warning(f"Error fetching {series}: {e}")
                 break
     results.sort(key=lambda x: x.get("strike") or 0)
     return results
 
 
-def get_kalshi_orderbook(market_ticker: str) -> dict | None:
+def get_kalshi_orderbook(ticker: str) -> dict | None:
     try:
-        r = requests.get(f"{BASE}/markets/{market_ticker}/orderbook", timeout=10)
+        r  = requests.get(f"{BASE}/markets/{ticker}/orderbook", timeout=10)
         r.raise_for_status()
         ob = r.json().get("orderbook", {})
         return {"yes_depth": ob.get("yes", [])[:5], "no_depth": ob.get("no", [])[:5]}
@@ -103,95 +106,141 @@ def get_kalshi_orderbook(market_ticker: str) -> dict | None:
         return None
 
 
+# ─────────────────────────────────────────
+# Kelly sizing
+# ─────────────────────────────────────────
+
+def kelly_fraction(edge: float, price: float) -> float:
+    """
+    Full Kelly fraction, capped 1–25%.
+    p = implied win prob from edge
+    b = net odds (payout per $1 risked on YES)
+    f = (p*b - (1-p)) / b
+    """
+    if price <= 0 or price >= 1 or edge == 0:
+        return 0.0
+    p = min(0.95, max(0.05, 0.5 + edge * 0.5))
+    b = (1.0 - price) / price          # net odds
+    f = (p * b - (1.0 - p)) / b
+    return round(min(0.25, max(0.01, f)), 4) if f > 0 else 0.0
+
+
+# ─────────────────────────────────────────
+# Scoring
+# ─────────────────────────────────────────
+
 def score_market(market: dict, algo, signals: dict) -> dict:
-    """Run the full decision scoring logic for one market. Returns enriched dict."""
     mid = market.get("mid_price")
     if mid is None:
-        return {**market, "edge": None, "signal_score": 0, "recommendation": "NO DATA", "reasons": [], "risks": []}
+        return {**market, "edge": None, "fair_value": None, "kelly": None,
+                "signal_score": 0, "recommendation": "NO DATA", "reasons": [], "risks": []}
 
-    edge = algo.edge(market["title"], mid)
+    edge   = algo.edge(market["title"], mid)
     spread = market.get("spread_est", 0.05) or 0.05
+    kelly  = kelly_fraction(edge, mid) if edge > 0 else 0.0
 
-    signal_score = 0
-    reasons, risks = [], []
+    score, reasons, risks = 0, [], []
 
+    # Edge strength
     if edge >= 0.10:
-        signal_score += 3
-        reasons.append(f"Strong edge ({edge:.1%})")
+        score += 3; reasons.append(f"Strong edge ({edge:.1%})")
     elif edge >= 0.05:
-        signal_score += 2
-        reasons.append(f"Moderate edge ({edge:.1%})")
+        score += 2; reasons.append(f"Moderate edge ({edge:.1%})")
     elif edge > 0:
-        signal_score += 1
-        reasons.append(f"Weak edge ({edge:.1%})")
+        score += 1; reasons.append(f"Weak edge ({edge:.1%})")
     else:
         risks.append(f"Negative edge ({edge:.1%})")
 
+    # Edge vs spread
     if edge > 0 and spread > 0:
         if edge >= 2 * spread:
-            signal_score += 2
-            reasons.append(f"Edge ≥ 2× spread")
+            score += 2; reasons.append("Edge ≥ 2× spread")
         elif edge >= spread:
-            signal_score += 1
-            reasons.append(f"Edge covers spread")
+            score += 1; reasons.append("Edge covers spread")
         else:
-            risks.append(f"Edge < spread")
+            risks.append("Edge < spread")
 
-    wti = signals.get("wti", {})
-    wti_chg = wti.get("wti_change", 0) or 0
+    # WTI
+    wti_chg = (signals.get("wti") or {}).get("wti_change", 0) or 0
     if wti_chg > 0.02:
-        signal_score += 1
-        reasons.append("WTI bullish")
+        score += 1; reasons.append(f"WTI rising ({wti_chg:+.1%})")
     elif wti_chg < -0.02:
-        risks.append("WTI bearish")
+        risks.append(f"WTI falling ({wti_chg:+.1%})")
 
-    inv = signals.get("inventory", {})
+    # Inventory
+    inv = signals.get("inventory") or {}
     if inv.get("current") is not None:
         z = inv.get("z_score", 0) or 0
         if z < -0.5:
-            signal_score += 1
-            reasons.append(f"Tight inventory (Z={z:.2f})")
+            score += 1; reasons.append(f"Tight inventory (Z={z:.2f})")
         elif z > 0.5:
             risks.append(f"Ample inventory (Z={z:.2f})")
 
-    sea = signals.get("seasonal", {})
-    mult = sea.get("multiplier", 1.0) or 1.0
+    # Seasonal
+    mult = (signals.get("seasonal") or {}).get("multiplier", 1.0) or 1.0
     if mult >= 1.05:
-        signal_score += 1
-        reasons.append(f"Seasonal tailwind ({mult:.2f}×)")
+        score += 1; reasons.append(f"Seasonal tailwind ({mult:.2f}×)")
     elif mult < 1.0:
         risks.append(f"Seasonal headwind ({mult:.2f}×)")
 
-    if signal_score >= 6:
-        rec = "🟢 STRONG BUY"
-    elif signal_score >= 4:
-        rec = "🟡 BUY"
-    elif signal_score >= 2 and edge > 0:
-        rec = "🟠 WEAK BUY"
-    else:
-        rec = "🔴 PASS"
+    if score >= 6:   rec = "🟢 STRONG BUY"
+    elif score >= 4: rec = "🟡 BUY"
+    elif score >= 2 and edge > 0: rec = "🟠 WEAK BUY"
+    else:            rec = "🔴 PASS"
 
     return {
         **market,
-        "edge":            edge,
-        "fair_value":      max(0.0, min(1.0, mid + edge)),
-        "signal_score":    signal_score,
-        "recommendation":  rec,
-        "reasons":         reasons,
-        "risks":           risks,
+        "edge":           edge,
+        "fair_value":     max(0.0, min(1.0, mid + edge)),
+        "kelly":          kelly,
+        "signal_score":   score,
+        "recommendation": rec,
+        "reasons":        reasons,
+        "risks":          risks,
     }
 
 
-# =========================
-# Page Config
-# =========================
+def run_full_scan(api_key: str, force: bool = False) -> tuple[list[dict], dict]:
+    """Fetch markets + FRED signals + score everything. Returns (scored, signals)."""
+    markets = search_kalshi_gas_markets()
+    if not markets:
+        return [], {}
+    algo    = ProGasAlgo(fred_api_key=api_key)
+    signals = algo.refresh_data(force=force)
+    scored  = [score_market(m, algo, signals) for m in markets]
+    scored  = [m for m in scored if m.get("edge") is not None]
+    scored.sort(key=lambda x: x.get("edge", -99), reverse=True)
+    return scored, signals
 
+
+# ─────────────────────────────────────────
+# Page Config
+# ─────────────────────────────────────────
 st.set_page_config(page_title="Pro Gas Algo", page_icon="⛽", layout="wide")
 
 
-# =========================
+# ─────────────────────────────────────────
+# Auto-Refresh Logic
+# ─────────────────────────────────────────
+
+# Initialize timestamps
+if "last_scan_time" not in st.session_state:
+    st.session_state["last_scan_time"] = 0.0
+if "auto_refresh_enabled" not in st.session_state:
+    st.session_state["auto_refresh_enabled"] = False
+
+now = time.time()
+time_since_last = now - st.session_state["last_scan_time"]
+next_refresh_in = max(0, AUTO_REFRESH_INTERVAL - time_since_last)
+
+# Trigger auto-rerun if enabled and interval elapsed
+if st.session_state["auto_refresh_enabled"] and time_since_last >= AUTO_REFRESH_INTERVAL:
+    st.session_state["trigger_auto_scan"] = True
+
+
+# ─────────────────────────────────────────
 # Sidebar
-# =========================
+# ─────────────────────────────────────────
 
 with st.sidebar:
     st.header("🔑 Configuration")
@@ -202,9 +251,34 @@ with st.sidebar:
     else:
         st.error("❌ Missing `FRED_API_KEY` in `.streamlit/secrets.toml`.")
 
-    if st.button("🔄 Force Refresh FRED Data"):
+    st.divider()
+    st.header("⏱️ Auto-Refresh")
+    auto_enabled = st.toggle(
+        "Auto-scan every 15 min",
+        value=st.session_state["auto_refresh_enabled"],
+        help="Automatically re-runs the full market scan every 15 minutes."
+    )
+    st.session_state["auto_refresh_enabled"] = auto_enabled
+
+    if auto_enabled:
+        if st.session_state["last_scan_time"] > 0:
+            mins, secs = divmod(int(next_refresh_in), 60)
+            st.info(f"⏳ Next scan in **{mins}m {secs}s**")
+            last_dt = datetime.fromtimestamp(st.session_state["last_scan_time"])
+            st.caption(f"Last scan: {last_dt.strftime('%H:%M:%S')}")
+        else:
+            st.info("▶️ Click **Auto-Scan** to start the first scan.")
+
+        if st.button("⏸️ Force Refresh Now"):
+            st.session_state["trigger_auto_scan"] = True
+            st.rerun()
+    else:
+        st.caption("Toggle on to enable automatic 15-minute rescanning.")
+
+    st.divider()
+    if st.button("🔄 Force Refresh FRED Cache"):
         st.session_state["force_refresh"] = True
-        st.success("✅ Will force refresh on next calculation.")
+        st.success("✅ Will refresh FRED on next scan.")
 
     force_refresh = st.session_state.pop("force_refresh", False)
 
@@ -213,26 +287,22 @@ with st.sidebar:
     st.markdown("""
 **Auto-Scan Mode**
 
-Click **🚀 Auto-Scan All Markets** to:
-1. Fetch ALL open gas markets
-2. Load live FRED signals once
-3. Score every market with the algo
-4. Rank by edge — top opportunities shown first
-
----
-
-**Signal Weights**
+Fetches ALL open gas markets, loads live FRED signals once, scores every market, and ranks by edge.
 
 | Signal | Weight |
 |---|---|
-| Gas Price Momentum | 35% |
-| WTI Crude Oil (lagged) | 25% |
-| Inventory Levels | 20% |
-| Refinery Utilization | 10% |
-| Regional PADD Prices | 5% |
-| Seasonal Adjustment | 5% |
+| Gas Momentum | 35% |
+| WTI Crude (lagged) | 25% |
+| Inventory | 20% |
+| Refinery Util. | 10% |
+| Regional PADD | 5% |
+| Seasonal | 5% |
 
----
+**Kelly Sizing**
+
+`f = (p·b − (1−p)) / b`
+
+where `p = 0.5 + edge×0.5`, capped 1–25%.
 
 **Decision Scores**
 
@@ -241,211 +311,201 @@ Click **🚀 Auto-Scan All Markets** to:
 - **2+** = Weak Buy
 - **<2** = Pass
 
----
-
-**⚠️ Disclaimer**
-
-Quantitative model only — not financial advice.
-Always size positions appropriately.
+⚠️ Not financial advice.
     """)
 
 
-# =========================
-# Main App
-# =========================
+# ─────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────
 
 st.title("⛽ Kalshi Pro Gas Algorithm")
 st.markdown("Multi-factor gas price prediction for Kalshi prediction markets — powered by FRED economic data.")
 
-# ─────────────────────────────────────────
-# AUTO-SCAN SECTION (new primary workflow)
-# ─────────────────────────────────────────
+# ── AUTO-SCAN SECTION ──
 st.subheader("🚀 Auto-Scan: All Open Markets")
-st.caption("Fetches all open gas markets, runs the algo on every one, and ranks by edge — no manual selection needed.")
+st.caption("Scores every open Kalshi gas market at once and ranks by edge.")
 
-col_btn1, col_btn2 = st.columns([1, 4])
+col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 4])
 with col_btn1:
-    run_scan = st.button("🚀 Auto-Scan All Markets", type="primary", use_container_width=True)
+    manual_scan = st.button("🚀 Scan Now", type="primary", use_container_width=True)
 with col_btn2:
-    min_edge = st.slider("Minimum Edge Threshold", 0.00, 0.25, 0.05, 0.01,
-                         help="Only show markets where |edge| ≥ this value")
+    min_edge = st.slider("Min Edge", 0.00, 0.25, 0.05, 0.01, label_visibility="collapsed")
+with col_btn3:
+    st.caption(f"Minimum edge threshold: **{min_edge:.0%}**")
 
-if run_scan:
+# Combine manual + auto triggers
+trigger_scan = manual_scan or st.session_state.pop("trigger_auto_scan", False)
+
+if trigger_scan:
     if not api_key:
         st.error("❌ No FRED API key. Add `FRED_API_KEY` to `.streamlit/secrets.toml`.")
     else:
-        progress = st.progress(0, text="Step 1/3 — Fetching open markets...")
-        with st.spinner(""):
-            markets = search_kalshi_gas_markets()
-
-        if not markets:
-            st.warning("No open gas markets found on Kalshi right now.")
-        else:
-            progress.progress(33, text=f"Step 2/3 — Loading FRED signals for {len(markets)} markets...")
+        progress = st.progress(0, text="Fetching markets...")
+        with st.spinner("Running full scan..."):
+            progress.progress(20, text="Fetching open markets from Kalshi...")
             try:
-                algo    = ProGasAlgo(fred_api_key=api_key)
-                signals = algo.refresh_data(force=force_refresh)
+                scored, signals = run_full_scan(api_key, force=force_refresh)
+                progress.progress(100, text="✅ Scan complete!")
+                st.session_state["scan_results"]   = scored
+                st.session_state["scan_signals"]   = signals
+                st.session_state["last_scan_time"] = time.time()
             except Exception as e:
-                st.error(f"❌ Failed to load FRED signals: {e}")
-                st.stop()
+                st.error(f"❌ Scan failed: {e}")
+                with st.expander("Traceback"):
+                    st.code(traceback.format_exc())
 
-            progress.progress(66, text="Step 3/3 — Scoring all markets with algo...")
-
-            scored = [score_market(m, algo, signals) for m in markets]
-            scored = [m for m in scored if m.get("edge") is not None]
-            scored.sort(key=lambda x: x.get("edge", -99), reverse=True)
-
-            progress.progress(100, text="✅ Scan complete!")
-            st.session_state["scan_results"] = scored
-            st.session_state["scan_signals"]  = signals
-
-# ── Display scan results ──
+# ── Display Results ──
 if "scan_results" in st.session_state:
-    scored   = st.session_state["scan_results"]
-    signals  = st.session_state["scan_signals"]
+    scored  = st.session_state["scan_results"]
+    signals = st.session_state["scan_signals"]
 
     buys      = [m for m in scored if "BUY" in m["recommendation"]]
     strong    = [m for m in scored if m["recommendation"] == "🟢 STRONG BUY"]
-    passes    = [m for m in scored if m["recommendation"] == "🔴 PASS"]
-    above_thr = [m for m in scored if abs(m.get("edge") or 0) >= min_edge]
+    above_thr = [m for m in scored if abs(m.get("edge") or 0) >= min_edge and m.get("edge", 0) > 0]
 
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("Total Markets Scanned", len(scored))
-    kpi2.metric("Strong Buys",  len(strong), delta=f"+{len(strong)}" if strong else "0")
-    kpi3.metric("Any Buy Signal", len(buys))
-    kpi4.metric(f"Above {min_edge:.0%} Edge", len(above_thr))
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Markets Scanned",    len(scored))
+    k2.metric("🟢 Strong Buys",     len(strong))
+    k3.metric("Any Buy Signal",     len(buys))
+    k4.metric(f"Above {min_edge:.0%} Edge", len(above_thr))
 
     st.markdown("### 🎯 Ranked Recommendations")
-    st.caption(f"Showing {len(above_thr)} markets with |edge| ≥ {min_edge:.0%}, sorted by edge (best first)")
 
     if above_thr:
         rows = []
         for m in above_thr:
             edge_val = m.get("edge", 0) or 0
+            kelly_val = m.get("kelly", 0) or 0
             rows.append({
-                "Rec":           m["recommendation"],
-                "Score":         m["signal_score"],
-                "Ticker":        m["ticker"],
-                "Title":         m["title"][:60] + ("…" if len(m["title"]) > 60 else ""),
-                "Strike":        f"${m['strike']:.2f}" if m.get("strike") is not None else "N/A",
-                "Mid Price":     f"{m['mid_price']:.0%}"   if m.get("mid_price") is not None else "N/A",
-                "Edge":          f"{edge_val:+.1%}",
-                "Fair Value":    f"{m['fair_value']:.0%}"  if m.get("fair_value") is not None else "N/A",
-                "Spread":        f"{m['spread_est']:.0%}"  if m.get("spread_est") is not None else "N/A",
-                "Volume":        m.get("volume") or 0,
-                "Closes":        m["close_time"][:10] if m.get("close_time") else "N/A",
-                "Key Reasons":   " · ".join(m.get("reasons", [])[:2]),
-                "Key Risks":     " · ".join(m.get("risks",   [])[:2]),
+                "Rec":          m["recommendation"],
+                "Score":        m["signal_score"],
+                "Ticker":       m["ticker"],
+                "Title":        m["title"][:55] + ("…" if len(m["title"]) > 55 else ""),
+                "Strike":       f"${m['strike']:.2f}" if m.get("strike") is not None else "N/A",
+                "Mid":          f"{m['mid_price']:.0%}"   if m.get("mid_price")  is not None else "N/A",
+                "Edge":         f"{edge_val:+.1%}",
+                "Fair Value":   f"{m['fair_value']:.0%}"  if m.get("fair_value") is not None else "N/A",
+                "Kelly %":      f"{kelly_val:.1%}" if kelly_val else "—",
+                "Spread":       f"{m['spread_est']:.0%}"  if m.get("spread_est") is not None else "N/A",
+                "Volume":       m.get("volume") or 0,
+                "Closes":       m["close_time"][:10] if m.get("close_time") else "N/A",
+                "Reasons":      " · ".join(m.get("reasons", [])[:2]),
             })
 
-        results_df = pd.DataFrame(rows)
+        rdf = pd.DataFrame(rows)
         st.dataframe(
-            results_df,
+            rdf,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Rec":   st.column_config.TextColumn("Rec", width="small"),
-                "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=8, format="%d"),
-                "Edge":  st.column_config.TextColumn("Edge", width="small"),
+                "Rec":     st.column_config.TextColumn("Rec",   width="small"),
+                "Score":   st.column_config.ProgressColumn("Score", min_value=0, max_value=8, format="%d"),
+                "Edge":    st.column_config.TextColumn("Edge",  width="small"),
+                "Kelly %": st.column_config.TextColumn("Kelly %", width="small",
+                            help="Fraction of bankroll to risk (Full Kelly, capped 1–25%)"),
             }
         )
 
-        # Download
-        csv = results_df.to_csv(index=False)
-        st.download_button("⬇️ Download Results CSV", csv, "kalshi_gas_scan.csv", "text/csv")
+        csv = rdf.to_csv(index=False)
+        dl1, dl2 = st.columns([1, 5])
+        with dl1:
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+            st.download_button("⬇️ CSV", csv, f"kalshi_gas_scan_{ts}.csv", "text/csv")
 
     else:
-        st.info(f"No markets meet the minimum edge threshold of {min_edge:.0%}. Try lowering it.")
+        st.info(f"No buy signals above {min_edge:.0%} edge threshold. Lower the slider to see more.")
 
-    # ── Live signals summary ──
-    with st.expander("📡 Live FRED Signals (used for all scores above)"):
-        s1, s2, s3, s4 = st.columns(4)
-        gm  = signals.get("gas_momentum", {})
-        wti = signals.get("wti", {})
-        inv = signals.get("inventory", {})
-        sea = signals.get("seasonal", {})
-        s1.metric("Gas Price",        f"${gm.get('current', 0):.3f}/gal" if gm.get("current") else "N/A")
-        s1.metric("4-Week Momentum",  f"{gm.get('momentum', 0):+.2%}")
-        s2.metric("WTI Crude",        f"${wti.get('current_wti', 0):.2f}/bbl" if wti.get("current_wti") else "N/A")
-        s2.metric("WTI Change",       f"{wti.get('wti_change', 0):+.2%}")
-        s3.metric("Inventory Status", inv.get("status", "N/A"))
-        s3.metric("Inventory Z",      f"{inv.get('z_score', 0):.2f}")
-        s4.metric("Seasonal Mult.",   f"{sea.get('multiplier', 1.0):.3f}×")
-        s4.metric("Seasonal Signal",  f"{sea.get('signal', 0):+.3f}")
+    # ── FRED Signal summary ──
+    with st.expander("📡 Live FRED Signals"):
+        gm  = signals.get("gas_momentum") or {}
+        wti = signals.get("wti")          or {}
+        inv = signals.get("inventory")    or {}
+        sea = signals.get("seasonal")     or {}
+        ref = signals.get("refinery")     or {}
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("Gas Price",       f"${gm.get('current', 0):.3f}/gal" if gm.get("current") else "N/A")
+        s1.metric("4-Wk Momentum",   f"{gm.get('momentum', 0):+.2%}")
+        s2.metric("WTI",             f"${wti.get('current_wti', 0):.2f}" if wti.get("current_wti") else "N/A")
+        s2.metric("WTI Change",      f"{wti.get('wti_change', 0):+.2%}")
+        s3.metric("Inventory",       inv.get("status", "N/A"))
+        s3.metric("Z-Score",         f"{inv.get('z_score', 0):.2f}")
+        s4.metric("Seasonal Mult.",  f"{sea.get('multiplier', 1.0):.3f}×")
+        s4.metric("Seasonal Signal", f"{sea.get('signal', 0):+.3f}")
+        s5.metric("Refinery",        ref.get("status", "N/A"))
+        s5.metric("Refinery Util.",  f"{ref.get('current', 0):.1f}%" if ref.get("current") else "N/A")
+
+# ── Auto-refresh countdown ticker (re-fires the page every 60s to update countdown) ──
+if st.session_state.get("auto_refresh_enabled") and st.session_state.get("last_scan_time", 0) > 0:
+    time_left = AUTO_REFRESH_INTERVAL - (time.time() - st.session_state["last_scan_time"])
+    if time_left > 0:
+        # Sleep 60s then rerun to update sidebar countdown and check if scan needed
+        time.sleep(min(60, time_left))
+        st.rerun()
+    else:
+        st.session_state["trigger_auto_scan"] = True
+        st.rerun()
 
 st.divider()
 
 # ─────────────────────────────────────────
-# MANUAL SINGLE-MARKET SECTION (unchanged)
+# MANUAL SINGLE-MARKET (unchanged below)
 # ─────────────────────────────────────────
 st.subheader("🔍 Manual Single-Market Analysis")
-st.caption("Browse and analyze one market at a time.")
 
 if st.button("🔍 Find Open Gas Markets"):
-    with st.spinner("Fetching open markets from Kalshi..."):
-        gas_markets = search_kalshi_gas_markets()
-    st.session_state["gas_markets"] = gas_markets
+    with st.spinner("Fetching..."):
+        gm_list = search_kalshi_gas_markets()
+    st.session_state["gas_markets"] = gm_list
     st.session_state.pop("selected_market", None)
-    st.session_state.pop("selected_orderbook", None)
 
 if "gas_markets" in st.session_state:
-    gas_markets = st.session_state["gas_markets"]
-    if not gas_markets:
-        st.warning("No open gas markets found on Kalshi right now.")
+    gm_list = st.session_state["gas_markets"]
+    if not gm_list:
+        st.warning("No open gas markets found.")
     else:
-        st.success(f"Found **{len(gas_markets)}** open gas markets.")
+        df = pd.DataFrame([{
+            "Select": False, "Ticker": m["ticker"], "Title": m["title"],
+            "Strike": f"${m['strike']:.2f}" if m.get("strike") is not None else "N/A",
+            "Mid":    f"{m['mid_price']:.0%}" if m.get("mid_price") is not None else "N/A",
+            "Volume": m.get("volume") or 0,
+            "Closes": m["close_time"][:10] if m.get("close_time") else "N/A",
+        } for m in gm_list])
 
-        df = pd.DataFrame([
-            {
-                "Select":        False,
-                "Ticker":        m["ticker"],
-                "Title":         m["title"],
-                "Strike":        f"${m['strike']:.2f}" if m.get("strike") is not None else "N/A",
-                "YES Bid":       f"{m['yes_bid']:.0%}"   if m.get("yes_bid")   is not None else "N/A",
-                "YES Ask":       f"{m['yes_ask']:.0%}"   if m.get("yes_ask")   is not None else "N/A",
-                "Mid":           f"{m['mid_price']:.0%}" if m.get("mid_price") is not None else "N/A",
-                "Spread":        f"{m['spread_est']:.0%}" if m.get("spread_est") is not None else "N/A",
-                "Volume":        m.get("volume") or 0,
-                "Open Interest": m.get("open_interest") or 0,
-                "Closes":        m["close_time"][:10] if m.get("close_time") else "N/A",
-            }
-            for m in gas_markets
-        ])
-
-        edited_df = st.data_editor(
-            df,
+        edited = st.data_editor(df,
             column_config={"Select": st.column_config.CheckboxColumn("Select")},
-            use_container_width=True,
-            hide_index=True,
-            key="market_table",
-        )
+            use_container_width=True, hide_index=True, key="market_table")
 
-        selected_rows = edited_df[edited_df["Select"] == True]
-        if len(selected_rows) > 1:
-            st.warning("Please select only one market at a time.")
-        elif len(selected_rows) == 1:
-            selected_ticker = selected_rows.iloc[0]["Ticker"]
-            selected_market = next((m for m in gas_markets if m["ticker"] == selected_ticker), None)
-            if selected_market:
-                st.session_state["selected_market"] = selected_market
-                with st.spinner(f"Fetching orderbook for {selected_ticker}..."):
-                    ob = get_kalshi_orderbook(selected_ticker)
-                st.session_state["selected_orderbook"] = ob
-
-# --- Market Input ---
-st.subheader("📋 Market Input")
+        sel = edited[edited["Select"] == True]
+        if len(sel) == 1:
+            ticker = sel.iloc[0]["Ticker"]
+            mkt    = next((m for m in gm_list if m["ticker"] == ticker), None)
+            if mkt:
+                st.session_state["selected_market"] = mkt
+                ob = get_kalshi_orderbook(ticker)
+                if ob:
+                    with st.expander("📊 Orderbook"):
+                        d1, d2 = st.columns(2)
+                        with d1:
+                            st.markdown("**YES Bids**")
+                            for row in ob["yes_depth"]:
+                                st.markdown(f"- {row[0]}¢ × {row[1]}")
+                        with d2:
+                            st.markdown("**NO Bids**")
+                            for row in ob["no_depth"]:
+                                st.markdown(f"- {row[0]}¢ × {row[1]}")
 
 sel_market = st.session_state.get("selected_market", {})
 default_title  = sel_market.get("title", "")
 default_mid    = float(sel_market["mid_price"])  if isinstance(sel_market.get("mid_price"),  (int, float)) else 0.50
 default_spread = float(sel_market["spread_est"]) if isinstance(sel_market.get("spread_est"), (int, float)) else 0.05
 
-col1, col2 = st.columns(2)
-with col1:
+c1, c2 = st.columns(2)
+with c1:
     title = st.text_input("Market Title", value=default_title,
                           placeholder="e.g. Will average gas prices be above $3.50?")
-with col2:
-    price = st.slider("Current YES Price (Mid)", 0.01, 0.99,
+with c2:
+    price = st.slider("YES Price (Mid)", 0.01, 0.99,
                       value=min(max(round(default_mid, 2), 0.01), 0.99), step=0.01)
 
 spread_input = st.number_input("Bid-Ask Spread", 0.0, 0.50,
@@ -456,52 +516,43 @@ if st.button("⚡ Calculate Edge", type="primary"):
     if not api_key:
         st.error("❌ No FRED API key.")
     elif not title.strip():
-        st.warning("⚠️ Please enter a Market Title.")
+        st.warning("⚠️ Enter a market title or select one above.")
     else:
-        with st.spinner("Fetching FRED data and calculating edge..."):
+        with st.spinner("Calculating..."):
             try:
                 algo    = ProGasAlgo(fred_api_key=api_key)
                 signals = algo.refresh_data(force=force_refresh)
-                if not signals:
-                    st.error("❌ FRED data fetch returned empty.")
-                    st.stop()
-
-                result = score_market(
+                result  = score_market(
                     {"ticker": "", "title": title.strip(), "mid_price": price,
                      "spread_est": spread_input, "yes_bid": None, "yes_ask": None,
                      "last_price": None, "volume": None, "open_interest": None,
                      "close_time": None, "strike": None},
                     algo, signals
                 )
-                edge = result["edge"]
+                edge  = result["edge"]
+                kelly = result["kelly"]
 
-                st.subheader("📊 Edge Result")
-                r1, r2, r3 = st.columns(3)
-                r1.metric("Market YES Price (Mid)", f"{price:.2%}")
-                r2.metric("Calculated Edge",        f"{edge:+.2%}")
-                r3.metric("Implied Fair Value",      f"{result['fair_value']:.2%}")
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("YES Mid Price",   f"{price:.2%}")
+                r2.metric("Calculated Edge", f"{edge:+.2%}")
+                r3.metric("Fair Value",      f"{result['fair_value']:.2%}")
+                r4.metric("Kelly Bet Size",  f"{kelly:.1%}" if kelly else "—",
+                          help="% of bankroll to risk (Full Kelly, capped 25%)")
 
-                st.subheader("🎯 Decision")
                 rec = result["recommendation"]
-                if "STRONG" in rec:
-                    st.success(rec)
-                elif "BUY" in rec and "WEAK" not in rec:
-                    st.success(rec)
-                elif "WEAK" in rec:
-                    st.warning(rec)
-                else:
-                    st.error(rec)
+                if "STRONG" in rec:   st.success(rec)
+                elif "WEAK" in rec:   st.warning(rec)
+                elif "BUY" in rec:    st.success(rec)
+                else:                 st.error(rec)
 
                 if result["reasons"]:
-                    st.markdown("**✅ Supporting Factors:**")
-                    for r in result["reasons"]:
-                        st.markdown(f"- {r}")
+                    st.markdown("**✅ Supporting:**")
+                    for r in result["reasons"]: st.markdown(f"- {r}")
                 if result["risks"]:
-                    st.markdown("**⚠️ Risk Factors:**")
-                    for r in result["risks"]:
-                        st.markdown(f"- {r}")
+                    st.markdown("**⚠️ Risks:**")
+                    for r in result["risks"]:   st.markdown(f"- {r}")
 
             except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
-                with st.expander("🔧 Full Traceback"):
+                st.error(f"❌ {e}")
+                with st.expander("Traceback"):
                     st.code(traceback.format_exc())
