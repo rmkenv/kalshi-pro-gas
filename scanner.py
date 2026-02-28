@@ -16,11 +16,25 @@ except ImportError:
     sys.exit(1)
 
 # ── Config from env ──
-FRED_API_KEY  = os.environ["FRED_API_KEY"]
-FROM_EMAIL    = os.environ["FROM_EMAIL"]
-TO_EMAIL      = os.environ["TO_EMAIL"]
-EMAIL_PASS    = os.environ["EMAIL_PASSWORD"]  # Gmail App Password
-MIN_EDGE      = float(os.environ.get("MIN_EDGE", "0.05"))
+FRED_API_KEY = os.environ.get("FRED_API_KEY")
+FROM_EMAIL   = os.environ.get("FROM_EMAIL")
+TO_EMAIL     = os.environ.get("TO_EMAIL")
+EMAIL_PASS   = os.environ.get("EMAIL_PASSWORD")
+MIN_EDGE     = float(os.environ.get("MIN_EDGE", "0.05"))
+
+# Validate required secrets up front with clear messages
+missing = [k for k, v in {
+    "FRED_API_KEY":   FRED_API_KEY,
+    "FROM_EMAIL":     FROM_EMAIL,
+    "TO_EMAIL":       TO_EMAIL,
+    "EMAIL_PASSWORD": EMAIL_PASS,
+}.items() if not v]
+
+if missing:
+    print(f"❌ Missing required environment variables: {', '.join(missing)}")
+    print("   Go to GitHub → Settings → Secrets and variables → Actions")
+    print("   and add each missing secret.")
+    sys.exit(1)
 
 BASE       = "https://api.elections.kalshi.com/trade-api/v2"
 GAS_SERIES = ["KXAAAGASM", "KXAAAGASW", "KXAAGASM", "KXAAGASW"]
@@ -93,32 +107,39 @@ def score_market(market, algo, signals):
     else:              risks.append(f"Negative edge ({edge:.1%})")
 
     if edge > 0 and spread > 0:
-        if edge >= 2 * spread:   score += 2; reasons.append("Edge ≥ 2× spread")
+        if edge >= 2  spread:   score += 2; reasons.append("Edge ≥ 2× spread")
         elif edge >= spread:     score += 1; reasons.append("Edge covers spread")
         else:                    risks.append("Edge < spread")
 
     wti_chg = (signals.get("wti") or {}).get("wti_change", 0) or 0
-    if wti_chg > 0.02:  score += 1; reasons.append(f"WTI rising ({wti_chg:+.1%})")
+    if wti_chg > 0.02:    score += 1; reasons.append(f"WTI rising ({wti_chg:+.1%})")
     elif wti_chg < -0.02: risks.append(f"WTI falling ({wti_chg:+.1%})")
 
     inv = signals.get("inventory") or {}
     if inv.get("current") is not None:
         z = inv.get("z_score", 0) or 0
-        if z < -0.5:   score += 1; reasons.append(f"Tight inventory (Z={z:.2f})")
-        elif z > 0.5:  risks.append(f"Ample inventory (Z={z:.2f})")
+        if z < -0.5:  score += 1; reasons.append(f"Tight inventory (Z={z:.2f})")
+        elif z > 0.5: risks.append(f"Ample inventory (Z={z:.2f})")
 
     mult = (signals.get("seasonal") or {}).get("multiplier", 1.0) or 1.0
     if mult >= 1.05:  score += 1; reasons.append(f"Seasonal tailwind ({mult:.2f}×)")
     elif mult < 1.0:  risks.append(f"Seasonal headwind ({mult:.2f}×)")
 
-    if score >= 6:        rec = "🟢 STRONG BUY"
-    elif score >= 4:      rec = "🟡 BUY"
-    elif score >= 2 and edge > 0: rec = "🟠 WEAK BUY"
-    else:                 rec = "🔴 PASS"
+    if score >= 6:                    rec = "🟢 STRONG BUY"
+    elif score >= 4:                  rec = "🟡 BUY"
+    elif score >= 2 and edge > 0:     rec = "🟠 WEAK BUY"
+    else:                             rec = "🔴 PASS"
 
-    return {**market, "edge": edge, "fair_value": max(0, min(1, mid + edge)),
-            "kelly": kelly, "signal_score": score,
-            "recommendation": rec, "reasons": reasons, "risks": risks}
+    return {
+        **market,
+        "edge":           edge,
+        "fair_value":     max(0, min(1, mid + edge)),
+        "kelly":          kelly,
+        "signal_score":   score,
+        "recommendation": rec,
+        "reasons":        reasons,
+        "risks":          risks,
+    }
 
 
 def send_alert(buys):
@@ -127,14 +148,16 @@ def send_alert(buys):
 
     rows = ""
     for m in buys:
-        color = "#1a7a1a" if "STRONG" in m["recommendation"] else \
-                "#7a6a00" if "WEAK" not in m["recommendation"] else "#7a3a00"
+        color  = "#1a7a1a" if "STRONG" in m["recommendation"] else \
+                 "#7a6a00" if "WEAK"   not in m["recommendation"] else "#7a3a00"
+        # ── fixed: was a broken f-string mixing quote styles ──
+        strike_str = f"${m['strike']:.2f}" if m.get("strike") is not None else "N/A"
         rows += f"""
         <tr>
           <td style="color:{color};font-weight:bold">{m['recommendation']}</td>
           <td>{m['ticker']}</td>
           <td>{m['title'][:60]}</td>
-          <td>${m['strike']:.2f}" if m.get('strike') else "N/A</td>
+          <td>{strike_str}</td>
           <td>{m['mid_price']:.0%}</td>
           <td><b>{m['edge']:+.1%}</b></td>
           <td>{m['fair_value']:.0%}</td>
@@ -147,7 +170,8 @@ def send_alert(buys):
     <html><body style="font-family:Arial,sans-serif">
     <h2>⛽ Kalshi Pro Gas — Buy Alert</h2>
     <p>Scanned at <b>{now_str}</b> — found <b>{len(buys)}</b> buy signal(s)</p>
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:13px">
+    <table border="1" cellpadding="6" cellspacing="0"
+           style="border-collapse:collapse;font-size:13px">
       <tr style="background:#f0f0f0">
         <th>Signal</th><th>Ticker</th><th>Title</th><th>Strike</th>
         <th>Mid</th><th>Edge</th><th>Fair Value</th>
@@ -165,9 +189,11 @@ def send_alert(buys):
     </body></html>"""
 
     strong_count = sum(1 for m in buys if "STRONG" in m["recommendation"])
-    subject = (f"🟢 {strong_count} STRONG BUY{'s' if strong_count != 1 else ''} found — Kalshi Pro Gas"
-               if strong_count else
-               f"🟡 {len(buys)} Buy Signal{'s' if len(buys) != 1 else ''} found — Kalshi Pro Gas")
+    subject = (
+        f"🟢 {strong_count} STRONG BUY{'s' if strong_count != 1 else ''} found — Kalshi Pro Gas"
+        if strong_count else
+        f"🟡 {len(buys)} Buy Signal{'s' if len(buys) != 1 else ''} found — Kalshi Pro Gas"
+    )
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -194,14 +220,14 @@ def main():
     scored  = [score_market(m, algo, signals) for m in markets]
     scored  = [m for m in scored if m is not None and m.get("edge") is not None]
 
-    buys = [m for m in scored
-            if "BUY" in m.get("recommendation", "")
-            and m.get("edge", 0) >= MIN_EDGE]
-
+    buys = [
+        m for m in scored
+        if "BUY" in m.get("recommendation", "")
+        and m.get("edge", 0) >= MIN_EDGE
+    ]
     buys.sort(key=lambda x: x.get("edge", 0), reverse=True)
 
     print(f"  Scored {len(scored)} markets, {len(buys)} buy signals above {MIN_EDGE:.0%}")
-
     for m in buys:
         print(f"  {m['recommendation']} {m['ticker']} — edge {m['edge']:+.1%} kelly {m['kelly']:.1%}")
 
