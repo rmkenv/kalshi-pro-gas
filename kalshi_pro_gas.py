@@ -22,8 +22,8 @@ class ProGasDataHub:
     SERIES_IDS = {
         'gas_national':  'GASREGW',       # U.S. Regular All Formulations Retail Gas - Weekly
         'wti_crude':     'DCOILWTICO',    # WTI Crude Oil - Daily
-        'gas_inventory': 'WGFUPUS2',      # Weekly U.S. Ending Stocks of Finished Motor Gasoline
-        'refinery_util': 'WPULEUS3',      # Weekly U.S. Refinery Operable Capacity Utilization
+        'gas_inventory': 'WGTSTUS1',      # Weekly U.S. Ending Stocks of Finished Motor Gasoline
+        'refinery_util': 'WGTSTUS2',      # Weekly U.S. Refinery Operable Capacity Utilization
         'padd1':         'GASREGCOVECW',  # East Coast (PADD 1)
         'padd2':         'GASREGMWW',     # Midwest (PADD 2)
         'padd3':         'GASREGGCW',     # Gulf Coast (PADD 3)
