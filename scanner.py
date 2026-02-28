@@ -21,7 +21,6 @@ TO_EMAIL     = os.environ.get("TO_EMAIL")
 EMAIL_PASS   = os.environ.get("EMAIL_PASSWORD")
 MIN_EDGE     = float(os.environ.get("MIN_EDGE", "0.05"))
 
-# Validate required secrets up front with clear messages
 missing = [k for k, v in {
     "FRED_API_KEY":   FRED_API_KEY,
     "FROM_EMAIL":     FROM_EMAIL,
@@ -37,6 +36,15 @@ if missing:
 
 BASE       = "https://api.elections.kalshi.com/trade-api/v2"
 GAS_SERIES = ["KXAAAGASM", "KXAAAGASW", "KXAAGASM", "KXAAGASW"]
+
+
+def kalshi_url(ticker: str) -> str:
+    """Build a direct Kalshi market URL from a ticker like KXAAAGASW-26MAR02-3.018"""
+    # Series slug is everything before the first hyphen-date segment
+    # e.g. KXAAAGASW-26MAR02-3.018 -> series=KXAAAGASW, market=KXAAAGASW-26MAR02-3.018
+    parts = ticker.split("-")
+    series = parts[0] if parts else ticker
+    return f"https://kalshi.com/markets/{series}/{ticker}"
 
 
 def fetch_markets():
@@ -71,6 +79,7 @@ def fetch_markets():
                         "spread_est": sprd,
                         "volume":     m.get("volume"),
                         "close_time": m.get("close_time"),
+                        "url":        kalshi_url(ticker),
                     })
                 cursor = data.get("cursor")
                 if not cursor or not markets:
@@ -167,7 +176,6 @@ def score_market(market, algo, signals):
 
 
 def send_alert(buys):
-    """Send an HTML email listing all buy opportunities."""
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     rows = ""
@@ -180,11 +188,12 @@ def send_alert(buys):
             color = "#7a3a00"
 
         strike_str = f"${m['strike']:.2f}" if m.get("strike") is not None else "N/A"
+        url        = m.get("url", "")
 
         rows += f"""
         <tr>
           <td style="color:{color};font-weight:bold">{m['recommendation']}</td>
-          <td>{m['ticker']}</td>
+          <td><a href="{url}" target="_blank">{m['ticker']}</a></td>
           <td>{m['title'][:60]}</td>
           <td>{strike_str}</td>
           <td>{m['mid_price']:.0%}</td>
@@ -193,6 +202,7 @@ def send_alert(buys):
           <td>{m['kelly']:.1%} of bankroll</td>
           <td>{m['signal_score']}/8</td>
           <td>{', '.join(m['reasons'][:2])}</td>
+          <td><a href="{url}" target="_blank">Trade</a></td>
         </tr>"""
 
     html = f"""
@@ -204,7 +214,7 @@ def send_alert(buys):
       <tr style="background:#f0f0f0">
         <th>Signal</th><th>Ticker</th><th>Title</th><th>Strike</th>
         <th>Mid</th><th>Edge</th><th>Fair Value</th>
-        <th>Kelly Size</th><th>Score</th><th>Reasons</th>
+        <th>Kelly Size</th><th>Score</th><th>Reasons</th><th>Link</th>
       </tr>
       {rows}
     </table>
@@ -259,6 +269,7 @@ def main():
     print(f"  Scored {len(scored)} markets, {len(buys)} buy signals above {MIN_EDGE:.0%}")
     for m in buys:
         print(f"  {m['recommendation']} {m['ticker']} -- edge {m['edge']:+.1%} kelly {m['kelly']:.1%}")
+        print(f"    {m['url']}")
 
     if buys:
         send_alert(buys)
